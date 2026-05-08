@@ -10,8 +10,7 @@ import sys
 import threading
 
 from .device import WaveXLR
-from . import setup
-import subprocess
+from . import setup, service
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
@@ -159,15 +158,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         info_group.add(self.serial_row)
 
     def _update_service_status(self):
-        """Check if the wavexlr systemd service is running."""
-        try:
-            r = subprocess.run(
-                ["systemctl", "--user", "is-active", "openwave.service"],
-                capture_output=True, text=True, timeout=3,
-            )
-            active = r.stdout.strip() == "active"
-        except Exception:
-            active = False
+        """Check if the audio service is running."""
+        active = service.is_running()
 
         if active:
             self.audio_status_icon.set_from_icon_name("emblem-ok-symbolic")

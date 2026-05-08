@@ -1,14 +1,13 @@
-"""First-run setup: udev rule, systemd service."""
+"""First-run setup: udev rule, audio service."""
 
 import os
 import subprocess
-import shutil
+
+from . import service
 
 UDEV_RULE = 'SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="007d", MODE="0666"'
 UDEV_PATH = "/etc/udev/rules.d/99-openwave.rules"
 UDEV_PATH_OLD = "/etc/udev/rules.d/99-wavexlr.rules"
-SERVICE_NAME = "openwave.service"
-APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def udev_installed():
@@ -23,11 +22,7 @@ def udev_installed():
 
 
 def service_installed():
-    r = subprocess.run(
-        ["systemctl", "--user", "is-enabled", SERVICE_NAME],
-        capture_output=True, text=True,
-    )
-    return r.stdout.strip() == "enabled"
+    return service.is_installed()
 
 
 def needs_setup():
@@ -60,32 +55,8 @@ done
 
 
 def install_service():
-    """Install and enable the systemd user service."""
-    service_dir = os.path.expanduser("~/.config/systemd/user")
-    os.makedirs(service_dir, exist_ok=True)
-
-    python = shutil.which("python3") or "/usr/bin/python3"
-
-    content = f"""[Unit]
-Description=OpenWave Audio Manager
-After=pipewire.service wireplumber.service
-
-[Service]
-Type=simple
-ExecStart={python} -c "from wavexlr.daemon import main; main()"
-WorkingDirectory={APP_DIR}
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-"""
-    path = os.path.join(service_dir, SERVICE_NAME)
-    with open(path, "w") as f:
-        f.write(content)
-
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE_NAME], check=True)
+    """Install and enable the audio service via the active backend."""
+    service.install()
     return True
 
 
@@ -110,15 +81,8 @@ def run_setup():
 
 
 def uninstall_service():
-    """Stop, disable, and remove the systemd user service."""
-    subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], capture_output=True)
-    subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME], capture_output=True)
-    path = os.path.join(os.path.expanduser("~/.config/systemd/user"), SERVICE_NAME)
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    """Stop, disable, and remove the audio service via the active backend."""
+    service.uninstall()
 
 
 def uninstall_udev():
@@ -144,8 +108,11 @@ def run_uninstall():
     messages = []
 
     if service_installed():
-        uninstall_service()
-        messages.append("Audio service removed")
+        try:
+            uninstall_service()
+            messages.append("Audio service removed")
+        except Exception as e:
+            return False, f"Failed to remove service: {e}"
 
     if udev_installed():
         if uninstall_udev():

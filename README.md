@@ -8,7 +8,7 @@ Linux control application for the **Elgato Wave XLR** microphone interface. A re
 - **Headphone controls** — Volume (syncs with hardware knob), low impedance mode
 - **Hardware sync** — 10 Hz polling keeps the app in sync with physical controls
 - **System integration** — Mute and HP volume sync bidirectionally with PipeWire/ALSA
-- **Audio capture fix** — Systemd daemon prevents the firmware race condition where mic goes silent
+- **Audio capture fix** — Background daemon (systemd or runit) prevents the firmware race condition where mic goes silent
 - **System tray** — Runs in background with tray icon, mute from tray menu
 - **First-run setup** — Configures udev permissions and audio service automatically
 
@@ -28,6 +28,11 @@ On Arch/CachyOS:
 sudo pacman -S gtk4 libadwaita python-gobject pipewire
 ```
 
+On Void Linux:
+```bash
+sudo xbps-install -S gtk4 libadwaita python3-gobject pipewire
+```
+
 ## Usage
 
 ```bash
@@ -37,6 +42,17 @@ python3 -m wavexlr
 ```
 
 On first launch, OpenWave will prompt to set up USB permissions (via polkit) and install the audio service.
+
+### Init systems
+
+OpenWave detects your init system at runtime:
+
+- **systemd** — the GUI installs a user unit at `~/.config/systemd/user/openwave.service` and enables it. No root needed for install or status checks.
+- **runit** (Artix, Void, Devuan-runit) — the GUI cannot install the system service itself (writing to `/etc/sv` requires root). Create a `wavexlr-audio` service directory at `/etc/sv/wavexlr-audio/` whose `run` script execs `python3 -m wavexlr.daemon` as your user (typically via `chpst -u`), then enable it with `ln -s /etc/sv/wavexlr-audio /var/service/`.
+
+  Status detection from the non-root GUI uses `sv check`; on stock Void the supervise FIFO is mode 0700, so OpenWave falls back to scanning `/proc` for the daemon process.
+
+- **other** (macOS, Windows, no init detected) — the capture-fix section is disabled.
 
 ### Start hidden in tray
 ```bash
