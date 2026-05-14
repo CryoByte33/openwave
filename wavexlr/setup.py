@@ -12,6 +12,7 @@ UDEV_PATH_OLD = "/etc/udev/rules.d/99-wavexlr.rules"
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WIREPLUMBER_SOURCES = (
     os.path.join(_APP_DIR, "wireplumber", "51-openwave-wave-xlr.conf"),
+    "/usr/local/share/openwave/wireplumber/51-openwave-wave-xlr.conf",
     "/usr/share/openwave/wireplumber/51-openwave-wave-xlr.conf",
 )
 WIREPLUMBER_PATH = os.path.expanduser(
