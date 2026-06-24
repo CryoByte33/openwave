@@ -30,7 +30,10 @@ import logging
 
 log = logging.getLogger("wavexlr.audio")
 
-SOURCE_MATCH = "alsa_input.usb-Elgato_Systems_Elgato_Wave_XLR"
+# Substring of the PipeWire node name. Kept loose ("Wave_XLR" rather than the
+# full Elgato_Systems_Elgato_Wave_XLR prefix) so it matches both the Wave XLR
+# and the Wave XLR mk 2 regardless of their exact USB string descriptors.
+SOURCE_MATCH = "Wave_XLR"
 
 # Seconds without byte flow before we consider the keepalive wedged. At
 # 48 kHz mono s16 the healthy rate is ~96 kB/s, so even 1s of silence is
@@ -77,7 +80,7 @@ def _get_source_node_name():
             continue
         props = obj.get("info", {}).get("props", {})
         name = props.get("node.name", "")
-        if name.startswith(SOURCE_MATCH):
+        if name.startswith("alsa_input") and SOURCE_MATCH in name:
             return name
     return None
 

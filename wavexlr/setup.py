@@ -5,7 +5,12 @@ import subprocess
 
 from . import service
 
-UDEV_RULE = 'SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="007d", MODE="0666"'
+UDEV_RULES = (
+    # Wave XLR
+    'SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="007d", MODE="0666"',
+    # Wave XLR mk 2
+    'SUBSYSTEM=="usb", ATTR{idVendor}=="0fd9", ATTR{idProduct}=="00b6", MODE="0666"',
+)
 UDEV_PATH = "/etc/udev/rules.d/99-openwave.rules"
 UDEV_PATH_OLD = "/etc/udev/rules.d/99-wavexlr.rules"
 
@@ -30,13 +35,17 @@ MIXES_PATH = os.path.expanduser(
 
 
 def udev_installed():
+    # Require a rule covering BOTH product IDs — an older 007d-only rule must be
+    # upgraded so the MK.2 (00b6) also gets 0666 access for the vendor protocol.
+    needed = ("007d", "00b6")
     for path in (UDEV_PATH, UDEV_PATH_OLD):
         try:
             with open(path) as f:
-                if "0fd9" in f.read():
-                    return True
+                content = f.read().lower()
         except (FileNotFoundError, PermissionError):
             continue
+        if all(pid in content for pid in needed):
+            return True
     return False
 
 
@@ -63,10 +72,13 @@ def needs_setup():
 
 def install_udev():
     """Install udev rule via pkexec."""
+    rules = "\n".join(UDEV_RULES)
     script = f"""#!/bin/sh
-echo '{UDEV_RULE}' > {UDEV_PATH}
+cat > {UDEV_PATH} <<'EOF'
+{rules}
+EOF
 udevadm control --reload-rules
-udevadm trigger --subsystem-match=usb --attr-match=idVendor=0fd9 --attr-match=idProduct=007d
+udevadm trigger --subsystem-match=usb --attr-match=idVendor=0fd9
 # Also chmod the device node directly so no replug is needed
 for dev in /dev/bus/usb/*/; do
     for f in "$dev"*; do
