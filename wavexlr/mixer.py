@@ -1,12 +1,17 @@
-"""Audio mixer — manages pw-loopback subprocesses for the matrix.
+"""Audio mixer — the GoXLR/Wave-Link-style submix engine.
 
-A loopback exists for each non-zero cell in the matrix (mic → mix), plus one
-that always routes Personal Mix → Wave XLR headphones so the user hears
-anything routed there. Volume + mute per cell are pushed onto the loopback's
-playback node via wpctl.
+Each app's output stream is *moved* (PipeWire target.object) onto a per-source
+null sink, so the source has one stable output; per-cell pw-loopback
+subprocesses route those monitors into the Personal/Chat/Record mix buses. That
+makes a matrix cell subtractive — lowering or muting it removes the source from
+the mix. The mic is captured from the Wave XLR directly. Personal feeds the
+headphones; Chat/Record are exposed to apps as selectable capture devices. Each
+source also has a master fader (effective send = cell × master).
 
-State is persisted to ~/.config/openwave/mixes.json so per-cell levels survive
-restarts (the loopbacks themselves do not — they're respawned by start()).
+Every operation that talks to pw-loopback / pw-cli / wpctl runs on a single
+background worker so the GTK main thread never blocks. Per-cell and master
+levels persist to ~/.config/openwave/mixes.json; the loopbacks themselves do
+not — they're (re)spawned by start() and refresh_device().
 """
 
 import atexit
@@ -192,7 +197,10 @@ def list_audio_streams():
 
 
 class Mixer:
-    """Manages pw-loopback subprocesses for the matrix's mic row."""
+    """Owns the submix routing: per-source sinks + stream moves, the per-cell
+    and mic→mix loopbacks, the Personal→HP loopback, the Chat/Record capture
+    devices, and per-source master faders. Public methods return immediately;
+    the pw-loopback/pw-cli/wpctl work runs on one background worker thread."""
 
     def __init__(self):
         self._lock = Lock()
@@ -382,6 +390,22 @@ class Mixer:
         """App-style sources (route from a src-sink monitor): System + user."""
         return [SYSTEM_SOURCE] + list(self._sources)
 
+    @staticmethod
+    def _create_null_sink(name, description):
+        """Create a lingering virtual Audio/Sink. Best-effort: on failure the
+        sink just isn't there yet and the next pass retries. Returns success."""
+        try:
+            subprocess.run(
+                ["pw-cli", "create-node", "adapter",
+                 "{ factory.name=support.null-audio-sink "
+                 f"node.name={name} node.description=\"{description}\" "
+                 "media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return True
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return False
+
     def _ensure_src_sink(self, source_id):
         """Create the source's virtual sink if it isn't live yet. Idempotent —
         the _sinks_created set prevents a registration race from making dupes."""
@@ -393,18 +417,8 @@ class Mixer:
             return
         nm = ("System" if source_id == SYSTEM_SOURCE
               else self._sources.get(source_id, {}).get("name", source_id))
-        desc = f"OpenWave: {nm}"
-        try:
-            subprocess.run(
-                ["pw-cli", "create-node", "adapter",
-                 "{ factory.name=support.null-audio-sink "
-                 f"node.name={name} node.description=\"{desc}\" "
-                 "media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"],
-                capture_output=True, text=True, timeout=5,
-            )
+        if self._create_null_sink(name, f"OpenWave: {nm}"):
             self._sinks_created.add(source_id)
-        except (FileNotFoundError, subprocess.SubprocessError):
-            pass
 
     def _destroy_src_sink(self, source_id):
         self._sinks_created.discard(source_id)
@@ -426,13 +440,7 @@ class Mixer:
         sink = MIX_SINKS[mix_id]
         try:
             if _node_id_by_name(sink, retries=2) is None:
-                subprocess.run(
-                    ["pw-cli", "create-node", "adapter",
-                     "{ factory.name=support.null-audio-sink "
-                     f"node.name={sink} node.description=\"{sink_desc}\" "
-                     "media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"],
-                    capture_output=True, text=True, timeout=5,
-                )
+                self._create_null_sink(sink, sink_desc)
                 time.sleep(0.3)  # let the .monitor register before the loopback binds
             key = ("mixsrc", mix_id)
             if key in self._procs:
@@ -623,11 +631,13 @@ class Mixer:
         self._reconcile_all()
 
     def _do_refresh_device(self):
-        # PipeWire/ALSA nodes lag the USB connect after a replug; poll briefly.
+        # PipeWire/ALSA nodes lag the USB connect after a replug; poll up to ~3s.
+        # Wait for the mic AND the headphones — they're the same device, so
+        # acting on whichever registers first would drop the other's loopback.
         mic = hp = None
         for _ in range(10):
             mic, hp = find_wave_xlr_alsa()
-            if mic or hp:
+            if mic and hp:
                 break
             time.sleep(0.3)
         self.mic, self.hp = mic, hp
