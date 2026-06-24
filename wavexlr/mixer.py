@@ -52,15 +52,16 @@ HP_LOOPBACK_KEY = "_personal_to_hp"
 HP_LOOPBACK_NODE = "openwave_loop_personal_to_hp"
 
 # Chat and Record are submix buses, each exposed to apps (Discord/OBS) as a
-# first-class capture device via module-remap-source over the bus's monitor —
-# a raw sink monitor isn't shown in app mic pickers, but a remap-source is. The
-# matrix routes sources into the sink. Personal isn't here — you hear it via the
-# headphones, you don't capture it. (pipewire-pulse truncates a remap source's
-# description at the first space, so the display names use a hyphen.)
-# Maps mix_id -> (sink_description, remap_source_name, remap_source_description).
+# first-class, app-selectable capture device: a pw-loopback captures the bus
+# sink's monitor and presents it as a media.class=Audio/Source node. (A raw
+# sink monitor isn't shown in app mic pickers; Audio/Source forwards audio and
+# is listable, whereas Audio/Source/Virtual has no output ports / no forwarding
+# on PW 1.6.7.) The matrix routes sources into the sink. Personal isn't here —
+# you hear it via the headphones, you don't capture it.
+# Maps mix_id -> (sink_description, source_node_name, source_description).
 MIX_DEVICES = {
-    "chat":   ("OpenWave Chat Mix",   "openwave_chat",   "OpenWave-Chat"),
-    "record": ("OpenWave Record Mix", "openwave_record", "OpenWave-Record"),
+    "chat":   ("OpenWave Chat Mix",   "openwave_chat",   "OpenWave Chat"),
+    "record": ("OpenWave Record Mix", "openwave_record", "OpenWave Record"),
 }
 
 
@@ -412,12 +413,12 @@ class Mixer:
             subprocess.run(["pw-cli", "destroy", nid], capture_output=True, text=True)
 
     def _ensure_mix_device(self, mix_id):
-        """Ensure a chat/record submix bus exists as a null sink plus a
-        remap-source exposing its monitor as a first-class, app-selectable
+        """Ensure a chat/record submix bus exists as a null sink, plus a
+        loopback that exposes its monitor as a first-class, app-selectable
         capture device (Discord/OBS list it like any mic; a bare monitor isn't
-        listed). The matrix routes sources into the sink. Both linger and are
-        adopted if already present, so the capture device is stable across
-        OpenWave restarts without a PipeWire restart."""
+        listed). The matrix routes sources into the sink; the loopback captures
+        the sink monitor and presents an Audio/Source — which forwards audio and
+        takes a spaced node.description, unlike Audio/Source/Virtual."""
         spec = MIX_DEVICES.get(mix_id)
         if spec is None:
             return
@@ -432,16 +433,23 @@ class Mixer:
                      "media.class=Audio/Sink audio.position=[FL FR] object.linger=true }"],
                     capture_output=True, text=True, timeout=5,
                 )
-                time.sleep(0.3)  # let the .monitor register before the remap binds
-            if _node_id_by_name(src_name, retries=1) is not None:
-                return  # adopt the existing remap source
-            subprocess.run(
-                ["pactl", "load-module", "module-remap-source",
-                 f"master={sink}.monitor", f"source_name={src_name}",
-                 f"source_properties=device.description={src_desc}"],
-                capture_output=True, text=True, timeout=5,
+                time.sleep(0.3)  # let the .monitor register before the loopback binds
+            key = ("mixsrc", mix_id)
+            if key in self._procs:
+                return
+            proc = subprocess.Popen(
+                ["pw-loopback",
+                 "--capture-props={ stream.capture.sink=true "
+                 f"target.object={sink} node.name=openwave_loop_{mix_id}_src_cap "
+                 "node.passive=true audio.position=[FL FR] }",
+                 "--playback-props={ media.class=Audio/Source "
+                 f"node.name={src_name} node.description=\"{src_desc}\" "
+                 "audio.position=[FL FR] }"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                preexec_fn=_set_pdeathsig,
             )
-        except (FileNotFoundError, subprocess.SubprocessError):
+            self._procs[key] = proc
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
             pass
 
     def _move_stream(self, stream_id, sink_name):
@@ -596,6 +604,7 @@ class Mixer:
         for key in list(self._procs.keys()):
             self._destroy_loopback(key)
         self._sweep_stale_loopbacks()
+        self._sweep_stale_remaps()
         # Pick up the device in case it became ready after the mixer was built.
         self.mic, self.hp = find_wave_xlr_alsa()
         for source_id in self._app_source_ids():
@@ -657,6 +666,25 @@ class Mixer:
         except (FileNotFoundError, subprocess.SubprocessError):
             return
         time.sleep(0.2)  # give the kernel a beat to reap so we don't race
+
+    @staticmethod
+    def _sweep_stale_remaps():
+        """Unload any module-remap-source left by older builds (we now expose
+        chat/record via a pw-loopback Audio/Source); a stale module would
+        collide on the same source name."""
+        try:
+            r = subprocess.run(
+                ["pactl", "list", "modules", "short"],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return
+        for line in r.stdout.splitlines():
+            if "module-remap-source" not in line:
+                continue
+            if "openwave_chat" in line or "openwave_record" in line:
+                idx = line.split("\t")[0]
+                subprocess.run(["pactl", "unload-module", idx], capture_output=True)
 
     # ----- internal -----
     def _reconcile_all(self):
