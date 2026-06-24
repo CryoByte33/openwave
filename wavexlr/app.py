@@ -7,19 +7,18 @@ gi.require_version('Adw', '1')
 from gi.repository import Gtk, Adw, GLib, GObject, Gio, Gdk
 import logging
 import os
+import signal
 import sys
 import threading
 
 from .device import WaveXLR, WaveXLRMk2, detect_pid, PID_MK2
 from .meter import MeterMonitor
-from .mixer import Mixer
+from .mixer import Mixer, SYSTEM_SOURCE, src_sink_name
 from .mixmatrix import MixMatrix
 from .sourcedialog import AddSourceDialog
 from . import setup, service, sources as sources_module
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
-
-GAIN_MAX = 0x5000
 
 
 class WaveXLRWindow(Adw.ApplicationWindow):
@@ -31,6 +30,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._last_state = None
         self._poll_id = None
         self._stream_poll_id = None
+        self._reconnect_id = None   # hotplug: GLib timeout polling for the device
+        self._connecting = False    # guards overlapping _try_connect attempts
         # Live-update throttle state for the device sliders (gain, hp).
         self._thr_pending = {}   # name -> latest value awaiting send
         self._thr_tid = {}       # name -> GLib timeout id (None = idle)
@@ -38,9 +39,6 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         # HP detent dB list when the device has a non-linear (stepped) HP
         # control; None = continuous dB slider. Set in _apply_caps.
         self._hp_detents = None
-        # Debounce slider events to coalesce a flurry of value-changed signals
-        # during a drag into one set_cell. {(source_id, mix_id): timeout_id}.
-        self._cell_debounce_ids = {}
         self._sources = sources_module.load()
 
         self._build_ui()
@@ -123,18 +121,26 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             icon_name="audio-input-microphone-symbolic",
             has_level=True,
         )
-        self.mic_source.connect("volume-changed", self._on_mic_matrix_volume_changed)
-        self.mic_source.connect("mute-toggled", self._on_mic_matrix_mute_toggled)
+        self._wire_source_master(self.mic_source, "mic")
+
+        # System catch-all: every app not added as its own source is routed here.
+        self.system_source = self.matrix.add_source(
+            SYSTEM_SOURCE, name="System",
+            icon_name="computer-symbolic",
+            has_level=True,
+        )
+        self._wire_source_master(self.system_source, SYSTEM_SOURCE)
 
         # User-defined app sources (persisted)
         for source_id, source in self._sources.items():
-            self.matrix.add_source(
+            cell = self.matrix.add_source(
                 source_id,
                 name=source.get("name", source_id),
                 icon_name=source.get("icon_name", "applications-multimedia-symbolic"),
                 has_level=True,
                 removable=True,
             )
+            self._wire_source_master(cell, source_id)
 
         self.matrix.connect("add-source-clicked", self._on_add_source_clicked)
         self.matrix.connect("remove-source-clicked", self._on_remove_source_clicked)
@@ -308,6 +314,9 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _try_connect(self):
+        if self._connecting:
+            return
+        self._connecting = True
         self.status_label.set_label("Connecting...")
         def _connect():
             self.xlr.disconnect()
@@ -325,6 +334,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
                 pass
             return {"state": self.xlr.get_all(), "info": info}
         def _done(result):
+            self._connecting = False
+            self._stop_reconnect()
             self.status_label.set_label("OpenWave")
             self.status_label.remove_css_class("dim-label")
             self._apply_caps()
@@ -333,12 +344,34 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             self.fw_label.set_label(info.get("fw_version", "—"))
             self.api_label.set_label(info.get("api_version", "—"))
             self.serial_label.set_label(info.get("serial", "—"))
+            # Rebuild the mic/HP loopbacks against the (possibly hotplugged) device.
+            self.mixer.refresh_device()
             self._start_polling()
         def _fail(e):
+            self._connecting = False
             logging.getLogger("wavexlr.app").warning("Connect failed: %r", e)
             self.status_label.set_label("Disconnected")
             self.status_label.add_css_class("dim-label")
+            self._start_reconnect()
         self._usb_async(_connect, _done, _fail)
+
+    def _start_reconnect(self):
+        """Poll for the Wave XLR coming back (hotplug) and reconnect when it does."""
+        if self._reconnect_id is None:
+            self._reconnect_id = GLib.timeout_add_seconds(2, self._reconnect_tick)
+
+    def _reconnect_tick(self):
+        if self.xlr.connected:
+            self._reconnect_id = None
+            return False
+        if not self._connecting and detect_pid() is not None:
+            self._try_connect()
+        return True
+
+    def _stop_reconnect(self):
+        if self._reconnect_id is not None:
+            GLib.source_remove(self._reconnect_id)
+            self._reconnect_id = None
 
     def _start_polling(self):
         """Start 10 Hz polling to sync hardware state."""
@@ -369,6 +402,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.status_label.add_css_class("dim-label")
         self.xlr.disconnect()
         self._stop_polling()
+        self._start_reconnect()
 
     def _apply_caps(self):
         """Enable/disable device-specific controls based on backend support."""
@@ -417,8 +451,6 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             self.hp_label.set_label(f"{state['hp_volume_db']:.1f} dB")
         self.lowz_row.set_active(state["low_impedance"])
         self.knob_label.set_label("Headphones" if state["volume_select"] == "hp" else "Gain")
-        self.mic_source.set_volume(state["gain_raw"] / GAIN_MAX)
-        self.mic_source.set_muted(state["mute"])
         self._updating_ui = False
 
     def _on_usb_error(self, e):
@@ -426,6 +458,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.status_label.add_css_class("dim-label")
         self.xlr.disconnect()
         self._stop_polling()
+        self._start_reconnect()
 
     def _on_mute_changed(self, row, _pspec):
         if self._updating_ui or not self.xlr.connected:
@@ -456,15 +489,20 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         if name not in self._thr_pending:
             return
         value = self._thr_pending.pop(name)
-        send_fn = self._thr_send[name]
-        self._usb_async(lambda: send_fn(value), on_error=self._on_usb_error)
+        self._thr_send[name](value)   # send_fn is responsible for any threading
+
+    def _send_gain(self, val):
+        self._usb_async(lambda: self.xlr.set_gain_raw(val), on_error=self._on_usb_error)
+
+    def _send_hp(self, db):
+        self._usb_async(lambda: self.xlr.set_hp_volume_db(db), on_error=self._on_usb_error)
 
     def _on_gain_changed(self, scale):
         if self._updating_ui or not self.xlr.connected:
             return
         val = int(scale.get_value())
         self.gain_label.set_label(self.xlr.format_gain(val))
-        self._throttle("gain", val, self.xlr.set_gain_raw)
+        self._throttle("gain", val, self._send_gain)
 
     def _on_hp_changed(self, scale):
         if self._updating_ui or not self.xlr.connected:
@@ -475,7 +513,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         else:
             db = scale.get_value()
         self.hp_label.set_label(f"{db:.1f} dB")
-        self._throttle("hp", db, self.xlr.set_hp_volume_db)
+        self._throttle("hp", db, self._send_hp)
 
     def _on_lowz_changed(self, row, _pspec):
         if self._updating_ui or not self.xlr.connected:
@@ -483,30 +521,48 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         enabled = row.get_active()
         self._usb_async(lambda: self.xlr.set_low_impedance(enabled), on_error=self._on_usb_error)
 
-    def _on_mic_matrix_volume_changed(self, _source, value):
-        if self._updating_ui or not self.xlr.connected:
-            return
-        raw = int(value * GAIN_MAX)
-        self.gain_label.set_label(self.xlr.format_gain(raw))
-        self._updating_ui = True
-        self.gain_scale.set_value(raw)
-        self._updating_ui = False
-        self._throttle("gain", raw, self.xlr.set_gain_raw)
+    def _wire_source_master(self, cell, source_id):
+        """Bind a source row's master fader/mute to the mixer's per-source master
+        (GoXLR channel fader: scales all that source's sends). For the mic this
+        is a software level — hardware gain lives only in the sidebar."""
+        cell.connect("volume-changed", self._on_source_master_volume_changed, source_id)
+        cell.connect("mute-toggled", self._on_source_master_mute_toggled, source_id)
 
-    def _on_mic_matrix_mute_toggled(self, _source, muted):
-        if self._updating_ui or not self.xlr.connected:
+    def _on_source_master_volume_changed(self, _source, value, source_id):
+        if self._updating_ui:
             return
-        self._updating_ui = True
-        self.mute_row.set_active(muted)
-        self._updating_ui = False
-        self._usb_async(lambda: self.xlr.set_mute(muted), on_error=self._on_usb_error)
+        self._throttle(
+            ("master", source_id), value,
+            lambda v, sid=source_id: self.mixer.set_master(
+                sid, v, self.mixer.get_master(sid)["muted"]),
+        )
+
+    def _on_source_master_mute_toggled(self, _source, muted, source_id):
+        if self._updating_ui:
+            return
+        self.mixer.set_master(source_id, self.mixer.get_master(source_id)["volume"], muted)
 
     def _wire_matrix_cells(self):
         """Bind each per-cell slider/mute to the mixer + restore persisted levels."""
-        source_ids = ["mic"] + list(self._sources.keys())
+        # First-run: make the System catch-all audible in Personal by default.
+        if f"{SYSTEM_SOURCE}.personal" not in self.mixer.cells():
+            self.mixer.set_cell(SYSTEM_SOURCE, "personal", 1.0, False)
+        source_ids = ["mic", SYSTEM_SOURCE] + list(self._sources.keys())
         for source_id in source_ids:
+            self._restore_source_master(source_id)
             for mix_id in ("personal", "chat", "record"):
                 self._wire_cell(source_id, mix_id)
+
+    def _restore_source_master(self, source_id):
+        """Set a source row's master fader/mute to the persisted level. Masters
+        default to 1.0, so this must run or the slider would sit at 0 while the
+        mixer treats it as full."""
+        cell = self.matrix.source(source_id)
+        if cell is None:
+            return
+        master = self.mixer.get_master(source_id)
+        cell.set_volume(master["volume"])
+        cell.set_muted(master["muted"])
 
     def _wire_cell(self, source_id, mix_id):
         cell = self.matrix.cell(source_id, mix_id)
@@ -531,12 +587,17 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         return True
 
     def _start_meters(self):
-        """Begin metering the mic + any app source that already has a matching stream."""
+        """Begin metering the mic, the System catch-all, and app sources."""
         if self.mixer.mic:
             self.meter.start(
                 "mic", self.mixer.mic,
                 lambda level: self._set_source_level("mic", level),
             )
+        # System level = its source sink's monitor (aggregate of unmatched apps).
+        self.meter.start(
+            SYSTEM_SOURCE, src_sink_name(SYSTEM_SOURCE),
+            lambda level: self._set_source_level(SYSTEM_SOURCE, level),
+        )
         for source_id in self._sources.keys():
             self._refresh_app_meter(source_id)
 
@@ -581,13 +642,18 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             name=name, match_app_name=match_app_name, icon_name=icon_name,
         )
         self._sources = sources_module.add(self._sources, source)
-        self.matrix.add_source(
+        cell = self.matrix.add_source(
             source["id"],
             name=source["name"],
             icon_name=source["icon_name"],
             has_level=True,
             removable=True,
         )
+        self._wire_source_master(cell, source["id"])
+        self._restore_source_master(source["id"])
+        # New sources are now *moved* onto a private sink, so they're silent
+        # until routed — default them audible in the Personal mix.
+        self.mixer.set_cell(source["id"], "personal", 1.0, False)
         self._wire_cell(source["id"], "personal")
         self._wire_cell(source["id"], "chat")
         self._wire_cell(source["id"], "record")
@@ -618,25 +684,14 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._sources = sources_module.remove(self._sources, source_id)
         self.mixer.remove_source(source_id)
 
-    _CELL_DEBOUNCE_MS = 150
-
     def _on_cell_volume_changed(self, _cell, value, source_id, mix_id):
-        # During a drag, value-changed fires continuously; coalesce into a
-        # single set_cell after the slider settles.
-        key = (source_id, mix_id)
-        prev = self._cell_debounce_ids.pop(key, None)
-        if prev is not None:
-            GLib.source_remove(prev)
-        self._cell_debounce_ids[key] = GLib.timeout_add(
-            self._CELL_DEBOUNCE_MS,
-            self._flush_cell_volume, source_id, mix_id, value,
+        # Live throttle (same as the device sliders): leading + ~80ms while
+        # dragging + trailing, so the mix updates in real time.
+        self._throttle(
+            ("cell", source_id, mix_id), value,
+            lambda v, s=source_id, m=mix_id: self.mixer.set_cell(
+                s, m, v, self.mixer.get_cell(s, m)["muted"]),
         )
-
-    def _flush_cell_volume(self, source_id, mix_id, value):
-        self._cell_debounce_ids.pop((source_id, mix_id), None)
-        cur = self.mixer.get_cell(source_id, mix_id)
-        self.mixer.set_cell(source_id, mix_id, value, cur["muted"])
-        return False  # one-shot
 
     def _on_cell_mute_toggled(self, _cell, muted, source_id, mix_id):
         cur = self.mixer.get_cell(source_id, mix_id)
@@ -663,6 +718,18 @@ class WaveXLRApp(Adw.Application):
             self._start_hidden = True
         self.activate()
         return 0
+
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        # Quit gracefully on SIGTERM/SIGINT (e.g. `pkill`) so do_shutdown runs
+        # mixer.stop() and apps are returned to their default output instead of
+        # being stranded on a now-orphaned source sink.
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, sig, self._on_quit_signal)
+
+    def _on_quit_signal(self):
+        self._quit_app()
+        return GLib.SOURCE_REMOVE
 
     def do_activate(self):
         if not self._window:
@@ -797,6 +864,7 @@ class WaveXLRApp(Adw.Application):
     def do_shutdown(self):
         if self._window:
             self._window._stop_polling()
+            self._window._stop_reconnect()
             self._window.xlr.disconnect()
         Adw.Application.do_shutdown(self)
 
