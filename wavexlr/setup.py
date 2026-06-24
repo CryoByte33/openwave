@@ -53,15 +53,47 @@ def service_installed():
     return service.is_installed()
 
 
+def service_current():
+    return service.is_current()
+
+
+def _read_first(sources):
+    """Return the content of the first existing source template, or None."""
+    for src in sources:
+        try:
+            with open(src) as f:
+                return f.read()
+        except (FileNotFoundError, PermissionError):
+            continue
+    return None
+
+
+def _installed_current(path, sources):
+    """True if `path` exists and matches the current source template, so a
+    re-run upgrades a stale file in place instead of skipping it. Falls back to
+    a plain existence check when the template can't be located."""
+    want = _read_first(sources)
+    try:
+        with open(path) as f:
+            have = f.read()
+    except (FileNotFoundError, PermissionError):
+        return False
+    return have == want if want is not None else True
+
+
 def wireplumber_installed():
-    return os.path.exists(WIREPLUMBER_PATH)
+    return _installed_current(WIREPLUMBER_PATH, WIREPLUMBER_SOURCES)
 
 
 def mixes_installed():
-    return os.path.exists(MIXES_PATH)
+    return _installed_current(MIXES_PATH, MIXES_SOURCES)
 
 
 def needs_setup():
+    # Config currency is included (static templates → reliable), but service
+    # *currency* is not: the unit's WorkingDirectory reflects the install
+    # location (site-packages vs a dev checkout), which differs harmlessly and
+    # would otherwise nag forever. A stale unit is still refreshed by run_setup.
     return (
         not udev_installed()
         or not service_installed()
@@ -106,12 +138,8 @@ def install_service():
 
 def install_wireplumber():
     """Drop the suspend-disable rule into the user's WirePlumber config."""
-    for src in WIREPLUMBER_SOURCES:
-        if os.path.exists(src):
-            with open(src) as f:
-                content = f.read()
-            break
-    else:
+    content = _read_first(WIREPLUMBER_SOURCES)
+    if content is None:
         raise FileNotFoundError(
             "WirePlumber rule source not found. Looked in: "
             + ", ".join(WIREPLUMBER_SOURCES)
@@ -168,12 +196,8 @@ def _create_mix_sink_live(name, description):
 
 def install_mixes():
     """Drop the three virtual mix sinks into the user's PipeWire config."""
-    for src in MIXES_SOURCES:
-        if os.path.exists(src):
-            with open(src) as f:
-                content = f.read()
-            break
-    else:
+    content = _read_first(MIXES_SOURCES)
+    if content is None:
         raise FileNotFoundError(
             "Mix sinks config source not found. Looked in: "
             + ", ".join(MIXES_SOURCES)
@@ -197,7 +221,9 @@ def run_setup():
             return False, "Failed to set up USB permissions (pkexec cancelled?)"
 
     # Install the WirePlumber rule before starting the service so the daemon's
-    # pw-cat attaches to a node that already has suspend disabled.
+    # pw-cat attaches to a node that already has suspend disabled. The checks
+    # are content-aware, so a re-run also refreshes a config that changed
+    # between OpenWave versions instead of skipping it.
     if not wireplumber_installed():
         try:
             install_wireplumber()
@@ -216,7 +242,7 @@ def run_setup():
         except Exception as e:
             return False, f"Failed to install mix sinks: {e}"
 
-    if not service_installed():
+    if not service_installed() or not service_current():
         try:
             install_service()
             messages.append("Audio service installed and started")
