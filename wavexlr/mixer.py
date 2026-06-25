@@ -29,7 +29,14 @@ from .pwnames import (
     PERSONAL_MIX_SINK, WAVE_XLR_MATCH, cap_node, capture_src_cap, cell_loop,
     src_sink,
 )
+from .routing import SYSTEM_SOURCE, plan
 from .sources import SourceSet
+
+
+def _is_cell_key(key):
+    """Cell-loopback keys are (source_id, mix_id). The HP loopback's key is a
+    str and the capture devices use ('mixsrc', mix_id), so neither matches."""
+    return isinstance(key, tuple) and len(key) == 2 and key[0] != "mixsrc"
 
 _log = logging.getLogger(__name__)
 
@@ -38,10 +45,6 @@ CONFIG_PATH = os.path.expanduser("~/.config/openwave/mixes.json")
 # Key into self._procs for the always-on Personal→headphones loopback (not a
 # node name — see pwnames.HP_LOOPBACK_NODE for that).
 HP_LOOPBACK_KEY = "_personal_to_hp"
-
-# Catch-all source: every app stream not matched by a user-defined source is
-# moved here, so everything is routable instead of leaking to the default sink.
-SYSTEM_SOURCE = "system"
 
 
 class Mixer:
@@ -57,6 +60,8 @@ class Mixer:
         self._lock = Lock()
         self._procs = {}
         self._loop_node_ids = {}   # cell key -> loopback playback node id (cached)
+        self._cell_state = {}      # cell key -> (volume, muted) last applied
+        self._move_targets = {}    # stream id -> sink last applied (move diff)
         self._state = self._load_state()
         self._sources = SourceSet()
         self._streams = {}
@@ -200,6 +205,7 @@ class Mixer:
 
     def _destroy_loopback(self, key):
         self._loop_node_ids.pop(key, None)
+        self._cell_state.pop(key, None)
         proc = self._procs.pop(key, None)
         if proc is None:
             return
@@ -295,16 +301,6 @@ class Mixer:
         self._pw.clear_stream(stream_id)
         self._moved.discard(stream_id)
 
-    def _reconcile_streams(self):
-        """Move each app output stream onto its source's sink — matched apps to
-        their own source, everything else to the System catch-all."""
-        with self._lock:
-            sources = SourceSet(self._sources)   # snapshot for matching
-            streams = dict(self._streams)
-        for stream_id, info in streams.items():
-            src = sources.source_for(info)
-            self._move_stream(stream_id, src_sink(src if src is not None else SYSTEM_SOURCE))
-
     # Below this, the slider snaps to 0 — sub-1% values keep the loopback alive
     # at imperceptible-but-not-silent volume and confuse "I put it back to 0".
     _ZERO_THRESHOLD = 0.01
@@ -349,10 +345,7 @@ class Mixer:
                 "volume": volume, "muted": bool(muted),
             }
             self._save_state()
-        self._enqueue(
-            ("cell", source_id, mix_id),
-            lambda sid=source_id, mid=mix_id: self._reconcile_cell(sid, mid),
-        )
+        self._enqueue(("apply",), self._apply_plan)
 
     def get_master(self, source_id):
         """Per-source master level (GoXLR channel fader). Scales every send."""
@@ -369,10 +362,7 @@ class Mixer:
                 "volume": volume, "muted": bool(muted),
             }
             self._save_state()
-        self._enqueue(
-            ("master", source_id),
-            lambda sid=source_id: self._reconcile_source(sid),
-        )
+        self._enqueue(("apply",), self._apply_plan)
 
     def set_sources(self, sources):
         """Update the app-source configuration; reconcile on worker. Before the
@@ -385,8 +375,7 @@ class Mixer:
     def _on_sources_changed(self):
         for source_id in self._app_source_ids():
             self._ensure_src_sink(source_id)
-        self._reconcile_streams()
-        self._reconcile_all()
+        self._apply_plan()
 
     def remove_source(self, source_id):
         """Forget persisted cells now; tear down loopbacks on worker."""
@@ -413,12 +402,8 @@ class Mixer:
         if added or removed:
             for sid in removed:
                 self._moved.discard(sid)
-            self._enqueue(("poll",), self._poll_reconcile)
+            self._enqueue(("apply",), self._apply_plan)
         return added, removed
-
-    def _poll_reconcile(self):
-        self._reconcile_streams()
-        self._reconcile_all()
 
     # ----- worker-side implementations -----
     def _do_start(self):
@@ -429,6 +414,7 @@ class Mixer:
         # handles that block respawns.)
         for key in list(self._procs.keys()):
             self._destroy_loopback(key)
+        self._move_targets.clear()   # re-assert every move from a clean slate
         self._pw.sweep_loopbacks()
         self._pw.unload_remap_modules(CAPTURE_SOURCE_NAMES)
         # Pick up the device in case it became ready after the mixer was built.
@@ -445,8 +431,7 @@ class Mixer:
             )
         with self._lock:
             self._streams = {s["id"]: s for s in self._pw.output_streams()}
-        self._reconcile_streams()
-        self._reconcile_all()
+        self._apply_plan()
 
     def _do_refresh_device(self):
         # PipeWire/ALSA nodes lag the USB connect after a replug; poll up to ~3s.
@@ -468,80 +453,45 @@ class Mixer:
             self._spawn_loopback(
                 HP_LOOPBACK_KEY, PERSONAL_MIX_SINK, self.hp, HP_LOOPBACK_NODE,
             )
-        for mix_id in MIX_SINKS:
-            self._reconcile_cell("mic", mix_id)
+        self._apply_plan()   # respawn the mic sends against the new device
 
     def _do_remove_source(self, source_id):
-        with self._lock:
-            keys = [
-                k for k in self._procs
-                if isinstance(k, tuple) and k and k[0] == source_id
-            ]
-        for k in keys:
-            self._destroy_loopback(k)
-        # The source is already gone from self._sources, so re-homing the
-        # streams moves its app onto the System catch-all (not back to default).
-        self._reconcile_streams()
+        # The source is already gone from self._sources, so the plan no longer
+        # includes its cell loopbacks (dropped here) and re-homes its app's
+        # streams onto the System catch-all.
+        self._apply_plan()
         self._destroy_src_sink(source_id)
 
-    # ----- internal -----
-    def _reconcile_all(self):
-        for source_id in (["mic"] + self._app_source_ids()):
-            for mix_id in MIX_SINKS:
-                self._reconcile_cell(source_id, mix_id)
+    # ----- internal: declarative apply -----
+    def _apply_plan(self):
+        """Compute the desired routing (routing.plan) and reconcile the live
+        graph to match, touching only the deltas. This is the single reconcile
+        path — every source/cell/master/stream change funnels here. App streams
+        are moved onto their source's sink, whose monitor each cell loopback
+        carries into a mix, which is what makes a cell subtractive."""
+        with self._lock:
+            sources = SourceSet(self._sources)
+            streams = dict(self._streams)
+            state = dict(self._state)
+        p = plan(sources, state, self.mic, streams)
 
-    def _reconcile_source(self, source_id):
-        """Re-apply every send for one source (after its master fader moves)."""
-        for mix_id in MIX_SINKS:
-            self._reconcile_cell(source_id, mix_id)
+        # Stream moves — only where the target sink changed.
+        for stream_id, sink in p.moves.items():
+            if self._move_targets.get(stream_id) != sink:
+                self._move_stream(stream_id, sink)
+                self._move_targets[stream_id] = sink
+        for stream_id in [s for s in self._move_targets if s not in p.moves]:
+            self._move_targets.pop(stream_id, None)   # stream is gone
 
-    def _apply_master(self, source_id, volume, muted):
-        """Fold the source's master fader into a cell: effective level is
-        cell × master, and the send is muted if either is muted."""
-        m = self._state.get(f"{source_id}.master", {"volume": 1.0, "muted": False})
-        return volume * m.get("volume", 1.0), (muted or m.get("muted", False))
-
-    def _reconcile_cell(self, source_id, mix_id):
-        state = self._state.get(
-            f"{source_id}.{mix_id}", {"volume": 0.0, "muted": False}
-        )
-        if source_id == "mic":
-            self._reconcile_mic_cell(mix_id, state["volume"], state["muted"])
-        else:
-            self._reconcile_app_cell(source_id, mix_id, state["volume"], state["muted"])
-
-    def _reconcile_mic_cell(self, mix_id, volume, muted):
-        if not self.mic:
-            return
-        mix_sink = MIX_SINKS.get(mix_id)
-        if not mix_sink:
-            return
-        volume, muted = self._apply_master("mic", volume, muted)
-        key = ("mic", mix_id)
-        node_name = cell_loop("mic", mix_id)
-        if volume <= 0.0:
+        # Cell loopbacks — destroy the ones no longer wanted, spawn the new
+        # ones, re-volume only those whose effective level actually changed.
+        desired = {s.key: s for s in p.sends}
+        for key in [k for k in self._procs if _is_cell_key(k) and k not in desired]:
             self._destroy_loopback(key)
-            return
-        if key not in self._procs:
-            self._spawn_loopback(key, self.mic, mix_sink, node_name)
-        self._set_loop_volume(key, node_name, volume, muted)
-
-    def _reconcile_app_cell(self, source_id, mix_id, volume, muted):
-        # The app's streams are moved onto the source sink (see _reconcile_streams),
-        # so we route the source sink's *monitor* into the mix — one stable
-        # loopback per cell, regardless of how many streams the app has. This is
-        # the only path from the source to the mix, so the cell is subtractive.
-        if source_id != SYSTEM_SOURCE and source_id not in self._sources:
-            return
-        mix_sink = MIX_SINKS.get(mix_id)
-        if not mix_sink:
-            return
-        volume, muted = self._apply_master(source_id, volume, muted)
-        key = (source_id, mix_id)
-        node_name = cell_loop(source_id, mix_id)
-        if volume <= 0.0:
-            self._destroy_loopback(key)
-            return
-        if key not in self._procs:
-            self._spawn_loopback(key, src_sink(source_id), mix_sink, node_name)
-        self._set_loop_volume(key, node_name, volume, muted)
+        for key, send in desired.items():
+            node_name = cell_loop(send.source_id, send.mix_id)
+            if key not in self._procs:
+                self._spawn_loopback(key, send.capture, send.target, node_name)
+            if self._cell_state.get(key) != (send.volume, send.muted):
+                self._set_loop_volume(key, node_name, send.volume, send.muted)
+                self._cell_state[key] = (send.volume, send.muted)
