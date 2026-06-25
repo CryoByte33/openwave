@@ -6,7 +6,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GObject  # noqa: E402
 
-from .mixer import list_audio_streams
+from .pipewire import output_streams
 
 ICON_CHOICES = (
     ("applications-multimedia-symbolic", "Generic"),
@@ -94,7 +94,7 @@ class AddSourceDialog(Adw.Dialog):
         return page
 
     def _populate_apps(self):
-        streams = list_audio_streams()
+        streams = output_streams()
         apps = {}
         for s in streams:
             apps.setdefault(s["app_name"], []).append(s)

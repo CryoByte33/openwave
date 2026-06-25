@@ -17,7 +17,7 @@ import gi
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
 
-from .mixer import _set_pdeathsig  # share the pdeathsig helper
+from .pipewire import _set_pdeathsig  # share the pdeathsig helper
 
 
 class MeterMonitor:
