@@ -633,11 +633,13 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             cell.set_level(level)
 
     def _on_add_source_clicked(self, _matrix):
-        dialog = AddSourceDialog()
+        dialog = AddSourceDialog(exclude_apps=self._sources.bound_apps())
         dialog.connect("source-confirmed", self._on_source_confirmed)
         dialog.present(self)
 
     def _on_source_confirmed(self, _dialog, name, match_app_name, icon_name):
+        if match_app_name in self._sources.bound_apps():
+            return  # already bound — the picker hides these, but guard anyway
         source = Source.new(name=name, match_app_name=match_app_name, icon_name=icon_name)
         self._sources.add(source)
         self._sources.save()

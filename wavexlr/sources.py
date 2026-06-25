@@ -69,6 +69,11 @@ class SourceSet:
     def get(self, source_id):
         return self._by_id.get(source_id)
 
+    def bound_apps(self):
+        """Application names already claimed by a source. One source per app —
+        a second binding would steal the first's streams (matching is by name)."""
+        return {s.match_app_name for s in self._by_id.values()}
+
     def add(self, source):
         self._by_id[source.id] = source
 
