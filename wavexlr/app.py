@@ -17,7 +17,8 @@ from .mixer import Mixer, SYSTEM_SOURCE
 from .pwnames import src_sink
 from .mixmatrix import MixMatrix
 from .sourcedialog import AddSourceDialog
-from . import setup, service, sources as sources_module
+from . import setup, service
+from .sources import Source, SourceSet
 
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
@@ -40,7 +41,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         # HP detent dB list when the device has a non-linear (stepped) HP
         # control; None = continuous dB slider. Set in _apply_caps.
         self._hp_detents = None
-        self._sources = sources_module.load()
+        self._sources = SourceSet.load()
 
         self._build_ui()
         self._update_service_status()
@@ -133,15 +134,15 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._wire_source_master(self.system_source, SYSTEM_SOURCE)
 
         # User-defined app sources (persisted)
-        for source_id, source in self._sources.items():
+        for source in self._sources:
             cell = self.matrix.add_source(
-                source_id,
-                name=source.get("name", source_id),
-                icon_name=source.get("icon_name", "applications-multimedia-symbolic"),
+                source.id,
+                name=source.name,
+                icon_name=source.icon_name,
                 has_level=True,
                 removable=True,
             )
-            self._wire_source_master(cell, source_id)
+            self._wire_source_master(cell, source.id)
 
         self.matrix.connect("add-source-clicked", self._on_add_source_clicked)
         self.matrix.connect("remove-source-clicked", self._on_remove_source_clicked)
@@ -548,7 +549,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         # First-run: make the System catch-all audible in Personal by default.
         if f"{SYSTEM_SOURCE}.personal" not in self.mixer.cells():
             self.mixer.set_cell(SYSTEM_SOURCE, "personal", 1.0, False)
-        source_ids = ["mic", SYSTEM_SOURCE] + list(self._sources.keys())
+        source_ids = ["mic", SYSTEM_SOURCE] + list(self._sources.ids())
         for source_id in source_ids:
             self._restore_source_master(source_id)
             for mix_id in ("personal", "chat", "record"):
@@ -583,7 +584,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
     def _stream_poll_tick(self):
         self.mixer.poll_streams()
-        for source_id in list(self._sources.keys()):
+        for source_id in list(self._sources.ids()):
             self._refresh_app_meter(source_id)
         return True
 
@@ -599,19 +600,17 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             SYSTEM_SOURCE, src_sink(SYSTEM_SOURCE),
             lambda level: self._set_source_level(SYSTEM_SOURCE, level),
         )
-        for source_id in self._sources.keys():
+        for source_id in self._sources.ids():
             self._refresh_app_meter(source_id)
 
     def _refresh_app_meter(self, source_id):
         """Re-point the meter at the first currently-matching stream, or stop it
         if none match. Called on stream-poll changes and source add."""
-        source = self._sources.get(source_id)
-        if not source:
+        if self._sources.get(source_id) is None:
             return
-        match = source.get("match_app_name")
         streams = self.mixer.streams()
         candidate = next(
-            (s for s in streams.values() if s.get("app_name") == match), None,
+            iter(self._sources.streams_for(source_id, streams.values())), None,
         )
         current = self._meter_targets.get(source_id)
         if candidate is None:
@@ -639,32 +638,31 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _on_source_confirmed(self, _dialog, name, match_app_name, icon_name):
-        source = sources_module.new_source(
-            name=name, match_app_name=match_app_name, icon_name=icon_name,
-        )
-        self._sources = sources_module.add(self._sources, source)
+        source = Source.new(name=name, match_app_name=match_app_name, icon_name=icon_name)
+        self._sources.add(source)
+        self._sources.save()
         cell = self.matrix.add_source(
-            source["id"],
-            name=source["name"],
-            icon_name=source["icon_name"],
+            source.id,
+            name=source.name,
+            icon_name=source.icon_name,
             has_level=True,
             removable=True,
         )
-        self._wire_source_master(cell, source["id"])
-        self._restore_source_master(source["id"])
+        self._wire_source_master(cell, source.id)
+        self._restore_source_master(source.id)
         # New sources are now *moved* onto a private sink, so they're silent
         # until routed — default them audible in the Personal mix.
-        self.mixer.set_cell(source["id"], "personal", 1.0, False)
-        self._wire_cell(source["id"], "personal")
-        self._wire_cell(source["id"], "chat")
-        self._wire_cell(source["id"], "record")
+        self.mixer.set_cell(source.id, "personal", 1.0, False)
+        self._wire_cell(source.id, "personal")
+        self._wire_cell(source.id, "chat")
+        self._wire_cell(source.id, "record")
         self.mixer.set_sources(self._sources)
         self.mixer.poll_streams()
-        self._refresh_app_meter(source["id"])
+        self._refresh_app_meter(source.id)
 
     def _on_remove_source_clicked(self, _matrix, source_id):
-        source = self._sources.get(source_id, {})
-        name = source.get("name", "this source")
+        source = self._sources.get(source_id)
+        name = source.name if source is not None else "this source"
         dialog = Adw.AlertDialog(
             heading="Remove source?",
             body=f"This deletes “{name}” and its mix levels. The bound application "
@@ -682,7 +680,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.meter.stop(source_id)
         self._meter_targets.pop(source_id, None)
         self.matrix.remove_source(source_id)
-        self._sources = sources_module.remove(self._sources, source_id)
+        self._sources.discard(source_id)
+        self._sources.save()
         self.mixer.remove_source(source_id)
 
     def _on_cell_volume_changed(self, _cell, value, source_id, mix_id):

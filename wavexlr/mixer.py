@@ -29,6 +29,7 @@ from .pwnames import (
     PERSONAL_MIX_SINK, WAVE_XLR_MATCH, cap_node, capture_src_cap, cell_loop,
     src_sink,
 )
+from .sources import SourceSet
 
 _log = logging.getLogger(__name__)
 
@@ -57,7 +58,7 @@ class Mixer:
         self._procs = {}
         self._loop_node_ids = {}   # cell key -> loopback playback node id (cached)
         self._state = self._load_state()
-        self._sources = {}
+        self._sources = SourceSet()
         self._streams = {}
         self._moved = set()          # stream ids we've retargeted (restore on exit)
         self._sinks_created = set()  # source ids whose src-sink is live (no dupes)
@@ -231,7 +232,7 @@ class Mixer:
     # ----- per-source sinks + stream moving -----
     def _app_source_ids(self):
         """App-style sources (route from a src-sink monitor): System + user."""
-        return [SYSTEM_SOURCE] + list(self._sources)
+        return [SYSTEM_SOURCE] + self._sources.ids()
 
     def _ensure_src_sink(self, source_id):
         """Create the source's virtual sink if it isn't live yet. Idempotent —
@@ -242,8 +243,9 @@ class Mixer:
         if self._pw.node_id(name, retries=3) is not None:
             self._sinks_created.add(source_id)  # adopt a leaked one from before
             return
+        source = self._sources.get(source_id)
         nm = ("System" if source_id == SYSTEM_SOURCE
-              else self._sources.get(source_id, {}).get("name", source_id))
+              else source.name if source is not None else source_id)
         if self._pw.create_null_sink(name, f"OpenWave: {nm}"):
             self._sinks_created.add(source_id)
 
@@ -297,11 +299,10 @@ class Mixer:
         """Move each app output stream onto its source's sink — matched apps to
         their own source, everything else to the System catch-all."""
         with self._lock:
-            sources = dict(self._sources)
+            sources = SourceSet(self._sources)   # snapshot for matching
             streams = dict(self._streams)
-        name_to_src = {s.get("match_app_name"): sid for sid, s in sources.items()}
         for stream_id, info in streams.items():
-            src = name_to_src.get(info.get("app_name"))
+            src = sources.source_for(info)
             self._move_stream(stream_id, src_sink(src if src is not None else SYSTEM_SOURCE))
 
     # Below this, the slider snaps to 0 — sub-1% values keep the loopback alive
@@ -377,7 +378,7 @@ class Mixer:
         """Update the app-source configuration; reconcile on worker. Before the
         mixer has started, just record them — _do_start does the initial build."""
         with self._lock:
-            self._sources = dict(sources)
+            self._sources = SourceSet(sources)
         if self._started:
             self._enqueue(("set_sources",), self._on_sources_changed)
 
@@ -394,7 +395,7 @@ class Mixer:
             for cell_key in [k for k in self._state if k.startswith(prefix)]:
                 del self._state[cell_key]
             self._save_state()
-            self._sources.pop(source_id, None)
+            self._sources.discard(source_id)
         self._enqueue(
             ("remove", source_id),
             lambda sid=source_id: self._do_remove_source(sid),
