@@ -329,7 +329,7 @@ class WaveXLR:
 # wValue 0x0004) and need a vendor *write* to change — not wired yet, so the
 # backend reports them unsupported and the UI greys/hides them.
 
-_MK2_UI_GAIN_MAX = 0x5000   # mirror app.GAIN_MAX: mic gain 0..max -> 0..this
+_MK2_UI_GAIN_MAX = 0x5000   # mirror the app gain slider range: 0..this -> 0..80 dB
 _MK2_HP_DB_MIN = -60.0      # headphone dB range (matches device + UI slider)
 _MK2_HP_DB_MAX = 0.0
 

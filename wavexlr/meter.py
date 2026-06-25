@@ -17,14 +17,15 @@ import gi
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib  # noqa: E402
 
-from .mixer import _set_pdeathsig  # share the pdeathsig helper
+from .pipewire import SubprocessPipeWire
 
 
 class MeterMonitor:
     SAMPLE_RATE = 8000
     CHUNK_BYTES = 256  # ~16 ms of s16 mono @ 8 kHz → ~60 Hz updates
 
-    def __init__(self):
+    def __init__(self, pw=None):
+        self._pw = pw or SubprocessPipeWire()
         self._procs = {}        # source_id -> Popen
         self._threads = {}      # source_id -> Thread
         self._stop_flags = {}   # source_id -> threading.Event
@@ -36,21 +37,8 @@ class MeterMonitor:
         thread at the chunk rate."""
         if source_id in self._procs:
             self.stop(source_id)
-        try:
-            proc = subprocess.Popen(
-                [
-                    "pw-cat", "--record",
-                    "--target", source_node_name,
-                    "--rate", str(self.SAMPLE_RATE),
-                    "--channels", "1",
-                    "--format", "s16",
-                    "-",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=_set_pdeathsig,
-            )
-        except (FileNotFoundError, OSError):
+        proc = self._pw.spawn_capture(source_node_name, rate=self.SAMPLE_RATE)
+        if proc is None:
             return
 
         stop_flag = threading.Event()

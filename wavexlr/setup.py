@@ -3,7 +3,10 @@
 import os
 import subprocess
 
-from . import service
+from . import pwnames, service
+from .pipewire import SubprocessPipeWire
+
+_pw = SubprocessPipeWire()
 
 UDEV_RULES = (
     # Wave XLR
@@ -53,15 +56,47 @@ def service_installed():
     return service.is_installed()
 
 
+def service_current():
+    return service.is_current()
+
+
+def _read_first(sources):
+    """Return the content of the first existing source template, or None."""
+    for src in sources:
+        try:
+            with open(src) as f:
+                return f.read()
+        except (FileNotFoundError, PermissionError):
+            continue
+    return None
+
+
+def _installed_current(path, sources):
+    """True if `path` exists and matches the current source template, so a
+    re-run upgrades a stale file in place instead of skipping it. Falls back to
+    a plain existence check when the template can't be located."""
+    want = _read_first(sources)
+    try:
+        with open(path) as f:
+            have = f.read()
+    except (FileNotFoundError, PermissionError):
+        return False
+    return have == want if want is not None else True
+
+
 def wireplumber_installed():
-    return os.path.exists(WIREPLUMBER_PATH)
+    return _installed_current(WIREPLUMBER_PATH, WIREPLUMBER_SOURCES)
 
 
 def mixes_installed():
-    return os.path.exists(MIXES_PATH)
+    return _installed_current(MIXES_PATH, MIXES_SOURCES)
 
 
 def needs_setup():
+    # Config currency is included (static templates → reliable), but service
+    # *currency* is not: the unit's WorkingDirectory reflects the install
+    # location (site-packages vs a dev checkout), which differs harmlessly and
+    # would otherwise nag forever. A stale unit is still refreshed by run_setup.
     return (
         not udev_installed()
         or not service_installed()
@@ -106,12 +141,8 @@ def install_service():
 
 def install_wireplumber():
     """Drop the suspend-disable rule into the user's WirePlumber config."""
-    for src in WIREPLUMBER_SOURCES:
-        if os.path.exists(src):
-            with open(src) as f:
-                content = f.read()
-            break
-    else:
+    content = _read_first(WIREPLUMBER_SOURCES)
+    if content is None:
         raise FileNotFoundError(
             "WirePlumber rule source not found. Looked in: "
             + ", ".join(WIREPLUMBER_SOURCES)
@@ -122,58 +153,30 @@ def install_wireplumber():
     return True
 
 
-MIX_SINKS = (
-    ("openwave_personal_mix", "OpenWave Personal Mix"),
-    ("openwave_chat_mix", "OpenWave Chat Mix"),
-    ("openwave_record_mix", "OpenWave Record Mix"),
+# (node name, description) for each mix-bus sink, from the shared vocabulary.
+MIX_SINKS = tuple(
+    (pwnames.MIX_SINKS[m], pwnames.MIX_SINK_DESCRIPTIONS[m])
+    for m in ("personal", "chat", "record")
 )
 
 
 def _mix_sink_exists(name):
     """Return True if a PipeWire/Pulse sink with this name is already live."""
-    try:
-        r = subprocess.run(
-            ["pactl", "list", "short", "sinks"],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return False
-    return any(line.split("\t", 2)[1] == name for line in r.stdout.splitlines() if "\t" in line)
+    return any(len(p) > 1 and p[1] == name for p in _pw.short_list("sinks"))
 
 
 def _create_mix_sink_live(name, description):
-    """Spawn a null sink immediately so it appears without a PipeWire restart."""
-    if _mix_sink_exists(name):
-        return
-    args = (
-        "{ "
-        "factory.name=support.null-audio-sink "
-        f"node.name={name} "
-        f'node.description="{description}" '
-        "media.class=Audio/Sink "
-        "audio.position=[FL FR] "
-        "object.linger=true "
-        "}"
-    )
-    try:
-        subprocess.run(
-            ["pw-cli", "create-node", "adapter", args],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        # pw-cli unavailable or PipeWire not reachable — the config file
-        # we just wrote will take effect on next PipeWire load.
-        pass
+    """Spawn a null sink immediately so it appears without a PipeWire restart.
+    No-op (and harmless) if the config file's sink is already live, or if
+    pw-cli can't reach PipeWire — the config takes effect on next load."""
+    if not _mix_sink_exists(name):
+        _pw.create_null_sink(name, description)
 
 
 def install_mixes():
     """Drop the three virtual mix sinks into the user's PipeWire config."""
-    for src in MIXES_SOURCES:
-        if os.path.exists(src):
-            with open(src) as f:
-                content = f.read()
-            break
-    else:
+    content = _read_first(MIXES_SOURCES)
+    if content is None:
         raise FileNotFoundError(
             "Mix sinks config source not found. Looked in: "
             + ", ".join(MIXES_SOURCES)
@@ -197,7 +200,9 @@ def run_setup():
             return False, "Failed to set up USB permissions (pkexec cancelled?)"
 
     # Install the WirePlumber rule before starting the service so the daemon's
-    # pw-cat attaches to a node that already has suspend disabled.
+    # pw-cat attaches to a node that already has suspend disabled. The checks
+    # are content-aware, so a re-run also refreshes a config that changed
+    # between OpenWave versions instead of skipping it.
     if not wireplumber_installed():
         try:
             install_wireplumber()
@@ -216,7 +221,7 @@ def run_setup():
         except Exception as e:
             return False, f"Failed to install mix sinks: {e}"
 
-    if not service_installed():
+    if not service_installed() or not service_current():
         try:
             install_service()
             messages.append("Audio service installed and started")

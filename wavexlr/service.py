@@ -12,8 +12,8 @@ Selection rule, in order:
     2. runit    if /var/service is a directory and `sv` is on PATH
     3. stub     otherwise
 
-Exposed at module scope: is_running(), is_installed(), install(), uninstall(),
-start(), stop(), plus `backend_name` for diagnostics.
+Exposed at module scope: is_running(), is_installed(), is_current(), install(),
+uninstall(), start(), stop(), plus `backend_name` for diagnostics.
 """
 
 import getpass
@@ -35,6 +35,7 @@ class _Stub:
 
     def is_running(self): return False
     def is_installed(self): return False
+    def is_current(self): return False
     def install(self): raise RuntimeError(self._MSG)
     def uninstall(self): raise RuntimeError(self._MSG)
     def start(self): raise RuntimeError(self._MSG)
@@ -43,12 +44,30 @@ class _Stub:
 
 class _Systemd:
     name = "systemd"
+    _UNIT_DIR = os.path.expanduser("~/.config/systemd/user")
 
     def _user(self, *args, check=False):
         return subprocess.run(
             ["systemctl", "--user", *args],
             capture_output=True, text=True, check=check,
         )
+
+    def _unit_content(self):
+        python = shutil.which("python3") or "/usr/bin/python3"
+        return f"""[Unit]
+Description=OpenWave Audio Manager
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart={python} -c "from wavexlr.daemon import main; main()"
+WorkingDirectory={_APP_DIR}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
+"""
 
     def is_running(self):
         try:
@@ -64,35 +83,31 @@ class _Systemd:
         r = self._user("is-enabled", SYSTEMD_UNIT)
         return r.stdout.strip() == "enabled"
 
+    def is_current(self):
+        """True if the installed unit matches what install() would write now."""
+        if not self.is_installed():
+            return False
+        try:
+            with open(os.path.join(self._UNIT_DIR, SYSTEMD_UNIT)) as f:
+                return f.read() == self._unit_content()
+        except (FileNotFoundError, PermissionError):
+            return False
+
     def install(self):
-        service_dir = os.path.expanduser("~/.config/systemd/user")
-        os.makedirs(service_dir, exist_ok=True)
-        python = shutil.which("python3") or "/usr/bin/python3"
-        content = f"""[Unit]
-Description=OpenWave Audio Manager
-After=pipewire.service wireplumber.service
-
-[Service]
-Type=simple
-ExecStart={python} -c "from wavexlr.daemon import main; main()"
-WorkingDirectory={_APP_DIR}
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-"""
-        with open(os.path.join(service_dir, SYSTEMD_UNIT), "w") as f:
-            f.write(content)
+        os.makedirs(self._UNIT_DIR, exist_ok=True)
+        with open(os.path.join(self._UNIT_DIR, SYSTEMD_UNIT), "w") as f:
+            f.write(self._unit_content())
+        # restart (not enable --now) so an upgraded unit is actually applied to
+        # an already-running daemon, not just written to disk.
         self._user("daemon-reload", check=True)
-        self._user("enable", "--now", SYSTEMD_UNIT, check=True)
+        self._user("enable", SYSTEMD_UNIT, check=True)
+        self._user("restart", SYSTEMD_UNIT, check=True)
 
     def uninstall(self):
         self._user("stop", SYSTEMD_UNIT)
         self._user("disable", SYSTEMD_UNIT)
-        path = os.path.join(os.path.expanduser("~/.config/systemd/user"), SYSTEMD_UNIT)
         try:
-            os.unlink(path)
+            os.unlink(os.path.join(self._UNIT_DIR, SYSTEMD_UNIT))
         except FileNotFoundError:
             pass
         self._user("daemon-reload")
@@ -153,6 +168,16 @@ class _Runit:
     name = "runit"
 
     _LINK = Path("/var/service") / RUNIT_SERVICE
+    _RUN_PATH = f"/etc/sv/{RUNIT_SERVICE}/run"
+
+    def _run_content(self):
+        user = getpass.getuser()
+        python = shutil.which("python3") or "/usr/bin/python3"
+        return (
+            "#!/bin/sh\n"
+            "exec 2>&1\n"
+            f'exec chpst -u {user} {python} -c "from wavexlr.daemon import main; main()"\n'
+        )
 
     def is_running(self):
         try:
@@ -173,23 +198,30 @@ class _Runit:
     def is_installed(self):
         return self._LINK.exists()
 
+    def is_current(self):
+        """True if the installed run script matches what install() would write."""
+        if not self.is_installed():
+            return False
+        try:
+            with open(self._RUN_PATH) as f:
+                return f.read() == self._run_content()
+        except (FileNotFoundError, PermissionError):
+            return False
+
     def install(self):
-        user = getpass.getuser()
-        python = shutil.which("python3") or "/usr/bin/python3"
+        run_content = self._run_content()
         script = f"""#!/bin/sh
 set -e
 mkdir -p /etc/sv/{RUNIT_SERVICE}/log /var/log/{RUNIT_SERVICE}
 cat > /etc/sv/{RUNIT_SERVICE}/run <<'RUN'
-#!/bin/sh
-exec 2>&1
-exec chpst -u {user} {python} -c "from wavexlr.daemon import main; main()"
-RUN
+{run_content}RUN
 cat > /etc/sv/{RUNIT_SERVICE}/log/run <<'LOG'
 #!/bin/sh
 exec svlogd -tt /var/log/{RUNIT_SERVICE}
 LOG
 chmod 755 /etc/sv/{RUNIT_SERVICE}/run /etc/sv/{RUNIT_SERVICE}/log/run
 ln -sf /etc/sv/{RUNIT_SERVICE} /var/service/{RUNIT_SERVICE}
+sv restart {RUNIT_SERVICE} 2>/dev/null || true
 """
         _pkexec_script(script)
 
@@ -236,6 +268,10 @@ def is_running():
 
 def is_installed():
     return _BACKEND.is_installed()
+
+
+def is_current():
+    return _BACKEND.is_current()
 
 
 def install():

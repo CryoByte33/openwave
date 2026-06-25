@@ -6,7 +6,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Gtk, Adw, GObject  # noqa: E402
 
-from .mixer import list_audio_streams
+from .pipewire import output_streams
 
 ICON_CHOICES = (
     ("applications-multimedia-symbolic", "Generic"),
@@ -30,8 +30,11 @@ class AddSourceDialog(Adw.Dialog):
         "source-confirmed": (GObject.SignalFlags.RUN_FIRST, None, (str, str, str)),
     }
 
-    def __init__(self):
+    def __init__(self, exclude_apps=()):
         super().__init__()
+        # Apps already bound to a source — hidden from the picker so an app
+        # can't be claimed twice (the second would steal the first's streams).
+        self._exclude_apps = set(exclude_apps)
         self.set_title("Add Source")
         self.set_content_width(480)
         self.set_content_height(560)
@@ -94,14 +97,17 @@ class AddSourceDialog(Adw.Dialog):
         return page
 
     def _populate_apps(self):
-        streams = list_audio_streams()
+        streams = output_streams()
         apps = {}
         for s in streams:
+            if s["app_name"] in self._exclude_apps:
+                continue  # already a source
             apps.setdefault(s["app_name"], []).append(s)
 
         if not apps:
-            empty = Adw.ActionRow(title="No audio streams playing")
-            empty.set_subtitle("Start playback in an app, then click + Add Source again")
+            empty = Adw.ActionRow(title="No new apps playing audio")
+            empty.set_subtitle("Every app currently playing is already a source, "
+                               "or nothing is playing. Start an app, then try again.")
             empty.set_sensitive(False)
             self._listbox.append(empty)
             return

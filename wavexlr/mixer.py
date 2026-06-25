@@ -1,180 +1,74 @@
-"""Audio mixer — manages pw-loopback subprocesses for the matrix.
+"""Audio mixer — the GoXLR/Wave-Link-style submix engine.
 
-A loopback exists for each non-zero cell in the matrix (mic → mix), plus one
-that always routes Personal Mix → Wave XLR headphones so the user hears
-anything routed there. Volume + mute per cell are pushed onto the loopback's
-playback node via wpctl.
+Each app's output stream is *moved* (PipeWire target.object) onto a per-source
+null sink, so the source has one stable output; per-cell pw-loopback
+subprocesses route those monitors into the Personal/Chat/Record mix buses. That
+makes a matrix cell subtractive — lowering or muting it removes the source from
+the mix. The mic is captured from the Wave XLR directly. Personal feeds the
+headphones; Chat/Record are exposed to apps as selectable capture devices. Each
+source also has a master fader (effective send = cell × master).
 
-State is persisted to ~/.config/openwave/mixes.json so per-cell levels survive
-restarts (the loopbacks themselves do not — they're respawned by start()).
+Every operation that talks to pw-loopback / pw-cli / wpctl runs on a single
+background worker so the GTK main thread never blocks. Per-cell and master
+levels persist to ~/.config/openwave/mixes.json; the loopbacks themselves do
+not — they're (re)spawned by start() and refresh_device().
 """
 
 import atexit
-import ctypes
 import json
 import logging
 import os
-import signal
 import subprocess
 import threading
 import time
 from threading import Event, Lock
 
+from .pipewire import SubprocessPipeWire
+from .pwnames import (
+    CAPTURE_SOURCE_NAMES, HP_LOOPBACK_NODE, MIX_DEVICES, MIX_SINKS,
+    PERSONAL_MIX_SINK, WAVE_XLR_MATCH, cap_node, capture_src_cap, cell_loop,
+    src_sink,
+)
+from .routing import SYSTEM_SOURCE, plan
+from .sources import SourceSet
+
+
+def _is_cell_key(key):
+    """Cell-loopback keys are (source_id, mix_id). The HP loopback's key is a
+    str and the capture devices use ('mixsrc', mix_id), so neither matches."""
+    return isinstance(key, tuple) and len(key) == 2 and key[0] != "mixsrc"
+
 _log = logging.getLogger(__name__)
-
-# Linux-only: make spawned children receive SIGTERM if our process dies.
-# Survives SIGKILL on the parent, hard crashes, anything that skips Python
-# cleanup paths. Without this, pw-loopback children leak on unclean exit.
-_PR_SET_PDEATHSIG = 1
-try:
-    _libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    _libc.prctl.argtypes = (
-        ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong,
-    )
-    _libc.prctl.restype = ctypes.c_int
-except (OSError, AttributeError):
-    _libc = None
-
-
-def _set_pdeathsig():
-    if _libc is not None:
-        _libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
 
 CONFIG_PATH = os.path.expanduser("~/.config/openwave/mixes.json")
 
-MIX_SINKS = {
-    "personal": "openwave_personal_mix",
-    "chat":     "openwave_chat_mix",
-    "record":   "openwave_record_mix",
-}
-PERSONAL_MIX_SINK = "openwave_personal_mix"
+# Key into self._procs for the always-on Personal→headphones loopback (not a
+# node name — see pwnames.HP_LOOPBACK_NODE for that).
 HP_LOOPBACK_KEY = "_personal_to_hp"
-HP_LOOPBACK_NODE = "openwave_loop_personal_to_hp"
-
-
-def _pactl_short(kind):
-    try:
-        r = subprocess.run(
-            ["pactl", "list", "short", kind],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return []
-    return [line.split("\t") for line in r.stdout.splitlines() if line.strip()]
-
-
-def find_wave_xlr_alsa():
-    """Return (mic_node_name, hp_node_name); either may be None if unplugged."""
-    mic = next(
-        (p[1] for p in _pactl_short("sources")
-         if len(p) > 1 and p[1].startswith("alsa_input") and "Wave_XLR" in p[1]),
-        None,
-    )
-    hp = next(
-        (p[1] for p in _pactl_short("sinks")
-         if len(p) > 1 and p[1].startswith("alsa_output") and "Wave_XLR" in p[1]),
-        None,
-    )
-    return mic, hp
-
-
-def _node_id_by_name(name, retries=20):
-    """Look up a PipeWire node's global id by node.name, polling briefly so
-    we don't race a just-spawned pw-loopback. Returns None if not found."""
-    for _ in range(retries):
-        try:
-            r = subprocess.run(
-                ["pw-cli", "ls", "Node"],
-                capture_output=True, text=True, timeout=3,
-            )
-        except (FileNotFoundError, subprocess.SubprocessError):
-            return None
-        current_id = None
-        for raw in r.stdout.splitlines():
-            line = raw.strip()
-            if line.startswith("id "):
-                try:
-                    current_id = line.split()[1].rstrip(",")
-                except (IndexError, ValueError):
-                    current_id = None
-            elif current_id and line == f'node.name = "{name}"':
-                return current_id
-        time.sleep(0.05)
-    return None
-
-
-def _wpctl(*args):
-    try:
-        subprocess.run(
-            ["wpctl", *args],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        pass
-
-
-def _ports(direction_flag, node_name):
-    """Return the list of `node:port` strings for one direction of a node.
-
-    direction_flag is '-i' (inputs) or '-o' (outputs). Filters pw-link's
-    global output to ports whose node.name equals `node_name`.
-    """
-    try:
-        r = subprocess.run(
-            ["pw-link", direction_flag],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return []
-    prefix = f"{node_name}:"
-    return [line.strip() for line in r.stdout.splitlines() if line.strip().startswith(prefix)]
-
-
-def list_audio_streams():
-    """Return [{id, app_name, media_name, node_name}, ...] for active output streams."""
-    import json as _json
-    try:
-        r = subprocess.run(
-            ["pw-dump"], capture_output=True, text=True, timeout=5,
-        )
-        if r.returncode != 0:
-            return []
-        objects = _json.loads(r.stdout)
-    except (FileNotFoundError, subprocess.SubprocessError, _json.JSONDecodeError):
-        return []
-
-    out = []
-    for obj in objects:
-        if obj.get("type") != "PipeWire:Interface:Node":
-            continue
-        props = (obj.get("info") or {}).get("props") or {}
-        if props.get("media.class") != "Stream/Output/Audio":
-            continue
-        app = props.get("application.name") or props.get("node.name") or "Unknown"
-        # Skip our own loopbacks
-        node_name = props.get("node.name", "")
-        if node_name.startswith("openwave_"):
-            continue
-        out.append({
-            "id": obj["id"],
-            "app_name": app,
-            "media_name": props.get("media.name", ""),
-            "node_name": node_name,
-            "binary": props.get("application.process.binary", ""),
-        })
-    return out
 
 
 class Mixer:
-    """Manages pw-loopback subprocesses for the matrix's mic row."""
+    """Owns the submix routing: per-source sinks + stream moves, the per-cell
+    and mic→mix loopbacks, the Personal→HP loopback, the Chat/Record capture
+    devices, and per-source master faders. Public methods return immediately;
+    the pw-loopback/pw-cli/wpctl work runs on one background worker thread."""
 
-    def __init__(self):
+    def __init__(self, pw=None):
+        # The PipeWire adapter is the only thing that touches the audio graph;
+        # injectable so a FakePipeWire can drive the routing logic in tests.
+        self._pw = pw or SubprocessPipeWire()
         self._lock = Lock()
         self._procs = {}
+        self._loop_node_ids = {}   # cell key -> loopback playback node id (cached)
+        self._cell_state = {}      # cell key -> (volume, muted) last applied
+        self._move_targets = {}    # stream id -> sink last applied (move diff)
         self._state = self._load_state()
-        self._sources = {}
+        self._sources = SourceSet()
         self._streams = {}
-        self.mic, self.hp = find_wave_xlr_alsa()
+        self._moved = set()          # stream ids we've retargeted (restore on exit)
+        self._sinks_created = set()  # source ids whose src-sink is live (no dupes)
+        self._started = False        # True after _do_start; gates pre-start reconciles
+        self.mic, self.hp = self._find_alsa()
 
         # Background worker: every operation that talks to pw-loopback /
         # pw-cli / wpctl runs here so the GTK main thread never blocks on a
@@ -192,6 +86,21 @@ class Mixer:
         # Belt-and-suspenders: even if do_shutdown is skipped, the interpreter
         # almost always runs atexit before the process image goes away.
         atexit.register(self._atexit_cleanup)
+
+    def _find_alsa(self):
+        """Return (mic_node_name, hp_node_name) for the Wave XLR; either may be
+        None if unplugged."""
+        mic = next(
+            (p[1] for p in self._pw.short_list("sources")
+             if len(p) > 1 and p[1].startswith("alsa_input") and WAVE_XLR_MATCH in p[1]),
+            None,
+        )
+        hp = next(
+            (p[1] for p in self._pw.short_list("sinks")
+             if len(p) > 1 and p[1].startswith("alsa_output") and WAVE_XLR_MATCH in p[1]),
+            None,
+        )
+        return mic, hp
 
     # ----- worker thread -----
     def _enqueue(self, key, task):
@@ -257,50 +166,46 @@ class Mixer:
         """
         if key in self._procs:
             return
-        capture_node_name = f"{node_name}_cap"
-        try:
-            proc = subprocess.Popen(
-                [
-                    "pw-loopback",
-                    "--capture-props="
-                    f"node.autoconnect=false node.name={capture_node_name} "
-                    "audio.channels=2 audio.position=[FL,FR]",
-                    "--playback-props="
-                    f"target.object={playback_target} node.name={node_name} "
-                    "audio.channels=2 audio.position=[FL,FR]",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                preexec_fn=_set_pdeathsig,
-            )
-        except (FileNotFoundError, OSError):
+        capture_node_name = cap_node(node_name)
+        proc = self._pw.spawn_loopback(
+            f"node.autoconnect=false node.name={capture_node_name} "
+            "audio.channels=2 audio.position=[FL,FR]",
+            f"target.object={playback_target} node.name={node_name} "
+            "audio.channels=2 audio.position=[FL,FR]",
+        )
+        if proc is None:
             return
         self._procs[key] = proc
         self._link_capture(capture_source_name, capture_node_name)
 
-    @staticmethod
-    def _link_capture(source_node_name, capture_node_name, retries=20):
+    def _link_capture(self, source_node_name, capture_node_name, retries=20):
         """Wire each output port of `source_node_name` to a corresponding
         input port of `capture_node_name`. Mono → stereo duplicates."""
         for _ in range(retries):
-            src_ports = _ports("-o", source_node_name)
-            dst_ports = _ports("-i", capture_node_name)
+            src_ports = self._pw.ports("-o", source_node_name)
+            dst_ports = self._pw.ports("-i", capture_node_name)
             if src_ports and dst_ports:
                 break
             time.sleep(0.05)
         else:
             return
         for i, dst in enumerate(dst_ports):
-            src = src_ports[i % len(src_ports)]
-            try:
-                subprocess.run(
-                    ["pw-link", src, dst],
-                    capture_output=True, text=True, timeout=2,
-                )
-            except (FileNotFoundError, subprocess.SubprocessError):
-                return
+            self._pw.link(src_ports[i % len(src_ports)], dst)
+
+    def _set_loop_volume(self, key, node_name, volume, muted):
+        """Apply volume/mute to a cell's loopback, caching its node id so we
+        don't run a (slow) `pw-cli ls` lookup on every slider change."""
+        node_id = self._loop_node_ids.get(key)
+        if node_id is None:
+            node_id = self._pw.node_id(node_name)
+            if node_id is not None:
+                self._loop_node_ids[key] = node_id
+        if node_id is not None:
+            self._pw.set_node_volume(node_id, volume, muted)
 
     def _destroy_loopback(self, key):
+        self._loop_node_ids.pop(key, None)
+        self._cell_state.pop(key, None)
         proc = self._procs.pop(key, None)
         if proc is None:
             return
@@ -325,6 +230,76 @@ class Mixer:
             except (OSError, ProcessLookupError):
                 continue
         self._procs.clear()
+        # Return any moved app streams to their default output so audio isn't
+        # left stranded on a (soon-to-vanish) source sink.
+        for stream_id in list(self._moved):
+            self._pw.clear_stream(stream_id)
+
+    # ----- per-source sinks + stream moving -----
+    def _app_source_ids(self):
+        """App-style sources (route from a src-sink monitor): System + user."""
+        return [SYSTEM_SOURCE] + self._sources.ids()
+
+    def _ensure_src_sink(self, source_id):
+        """Create the source's virtual sink if it isn't live yet. Idempotent —
+        the _sinks_created set prevents a registration race from making dupes."""
+        if source_id in self._sinks_created:
+            return
+        name = src_sink(source_id)
+        if self._pw.node_id(name, retries=3) is not None:
+            self._sinks_created.add(source_id)  # adopt a leaked one from before
+            return
+        source = self._sources.get(source_id)
+        nm = ("System" if source_id == SYSTEM_SOURCE
+              else source.name if source is not None else source_id)
+        if self._pw.create_null_sink(name, f"OpenWave: {nm}"):
+            self._sinks_created.add(source_id)
+
+    def _destroy_src_sink(self, source_id):
+        self._sinks_created.discard(source_id)
+        nid = self._pw.node_id(src_sink(source_id), retries=1)
+        if nid is not None:
+            self._pw.destroy_node(nid)
+
+    def _ensure_mix_device(self, mix_id):
+        """Ensure a chat/record submix bus exists as a null sink, plus a
+        loopback that exposes its monitor as a first-class, app-selectable
+        capture device (Discord/OBS list it like any mic; a bare monitor isn't
+        listed). The matrix routes sources into the sink; the loopback captures
+        the sink monitor and presents an Audio/Source — which forwards audio and
+        takes a spaced node.description, unlike Audio/Source/Virtual."""
+        spec = MIX_DEVICES.get(mix_id)
+        if spec is None:
+            return
+        sink_desc, src_name, src_desc = spec
+        sink = MIX_SINKS[mix_id]
+        try:
+            if self._pw.node_id(sink, retries=2) is None:
+                self._pw.create_null_sink(sink, sink_desc)
+                time.sleep(0.3)  # let the .monitor register before the loopback binds
+            key = ("mixsrc", mix_id)
+            if key in self._procs:
+                return
+            proc = self._pw.spawn_loopback(
+                "{ stream.capture.sink=true "
+                f"target.object={sink} node.name={capture_src_cap(mix_id)} "
+                "node.passive=true audio.position=[FL FR] }",
+                "{ media.class=Audio/Source "
+                f"node.name={src_name} node.description=\"{src_desc}\" "
+                "audio.position=[FL FR] }",
+            )
+            if proc is not None:
+                self._procs[key] = proc
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            pass
+
+    def _move_stream(self, stream_id, sink_name):
+        if self._pw.move_stream(stream_id, sink_name):
+            self._moved.add(stream_id)
+
+    def _clear_move(self, stream_id):
+        self._pw.clear_stream(stream_id)
+        self._moved.discard(stream_id)
 
     # Below this, the slider snaps to 0 — sub-1% values keep the loopback alive
     # at imperceptible-but-not-silent volume and confuse "I put it back to 0".
@@ -334,6 +309,13 @@ class Mixer:
     def start(self):
         """Spawn always-on Personal→HP loopback, snapshot streams, restore cells."""
         self._enqueue(("start",), self._do_start)
+
+    def refresh_device(self):
+        """Re-detect the Wave XLR ALSA nodes and rebuild the mic/HP loopbacks.
+        Call after a (re)connect/hotplug: node names can change and the old
+        loopbacks break when the device vanishes. App sources are untouched —
+        their sinks and moves don't depend on the device."""
+        self._enqueue(("refresh_device",), self._do_refresh_device)
 
     def stop(self):
         """Stop the worker and tear down every loopback. Brief block expected."""
@@ -346,6 +328,12 @@ class Mixer:
         with self._lock:
             for key in list(self._procs.keys()):
                 self._destroy_loopback(key)
+            sources = self._app_source_ids()
+        # Return moved app streams to default, then remove the source sinks.
+        for stream_id in list(self._moved):
+            self._clear_move(stream_id)
+        for source_id in sources:
+            self._destroy_src_sink(source_id)
 
     def set_cell(self, source_id, mix_id, volume, muted):
         """Persist state synchronously; reconcile the cell on the worker."""
@@ -357,16 +345,37 @@ class Mixer:
                 "volume": volume, "muted": bool(muted),
             }
             self._save_state()
-        self._enqueue(
-            ("cell", source_id, mix_id),
-            lambda sid=source_id, mid=mix_id: self._reconcile_cell(sid, mid),
-        )
+        self._enqueue(("apply",), self._apply_plan)
+
+    def get_master(self, source_id):
+        """Per-source master level (GoXLR channel fader). Scales every send."""
+        return self._state.get(f"{source_id}.master", {"volume": 1.0, "muted": False})
+
+    def set_master(self, source_id, volume, muted):
+        """Persist the source's master level; re-reconcile all its sends so each
+        cell's effective level becomes cell × master."""
+        volume = max(0.0, min(1.0, float(volume)))
+        if volume < self._ZERO_THRESHOLD:
+            volume = 0.0
+        with self._lock:
+            self._state[f"{source_id}.master"] = {
+                "volume": volume, "muted": bool(muted),
+            }
+            self._save_state()
+        self._enqueue(("apply",), self._apply_plan)
 
     def set_sources(self, sources):
-        """Update the app-source configuration; reconcile on worker."""
+        """Update the app-source configuration; reconcile on worker. Before the
+        mixer has started, just record them — _do_start does the initial build."""
         with self._lock:
-            self._sources = dict(sources)
-        self._enqueue(("set_sources",), self._reconcile_all)
+            self._sources = SourceSet(sources)
+        if self._started:
+            self._enqueue(("set_sources",), self._on_sources_changed)
+
+    def _on_sources_changed(self):
+        for source_id in self._app_source_ids():
+            self._ensure_src_sink(source_id)
+        self._apply_plan()
 
     def remove_source(self, source_id):
         """Forget persisted cells now; tear down loopbacks on worker."""
@@ -375,7 +384,7 @@ class Mixer:
             for cell_key in [k for k in self._state if k.startswith(prefix)]:
                 del self._state[cell_key]
             self._save_state()
-            self._sources.pop(source_id, None)
+            self._sources.discard(source_id)
         self._enqueue(
             ("remove", source_id),
             lambda sid=source_id: self._do_remove_source(sid),
@@ -385,113 +394,104 @@ class Mixer:
         """Refresh the active-stream cache; reconcile on worker if anything moved.
 
         Returns (added, removed) stream-id sets for the caller's bookkeeping."""
-        new = {s["id"]: s for s in list_audio_streams()}
+        new = {s["id"]: s for s in self._pw.output_streams()}
         with self._lock:
             added = set(new) - set(self._streams)
             removed = set(self._streams) - set(new)
             self._streams = new
         if added or removed:
-            self._enqueue(("poll",), self._reconcile_all)
+            for sid in removed:
+                self._moved.discard(sid)
+            self._enqueue(("apply",), self._apply_plan)
         return added, removed
 
     # ----- worker-side implementations -----
     def _do_start(self):
-        self._sweep_stale_loopbacks()
+        self._started = True
+        # Rebuild from a clean slate: drop anything we already spawned, then
+        # sweep loopbacks leaked from a previous process. (Destroying our own
+        # first keeps self._procs in sync — the sweep would otherwise leave dead
+        # handles that block respawns.)
+        for key in list(self._procs.keys()):
+            self._destroy_loopback(key)
+        self._move_targets.clear()   # re-assert every move from a clean slate
+        self._pw.sweep_loopbacks()
+        self._pw.unload_remap_modules(CAPTURE_SOURCE_NAMES)
+        # Pick up the device in case it became ready after the mixer was built.
+        self.mic, self.hp = self._find_alsa()
+        for source_id in self._app_source_ids():
+            self._ensure_src_sink(source_id)
+        # Ensure the chat/record submix sinks exist before reconciling so the
+        # cell loopbacks have a sink to route into.
+        for mix_id in MIX_DEVICES:
+            self._ensure_mix_device(mix_id)
         if self.hp:
             self._spawn_loopback(
                 HP_LOOPBACK_KEY, PERSONAL_MIX_SINK, self.hp, HP_LOOPBACK_NODE,
             )
         with self._lock:
-            self._streams = {s["id"]: s for s in list_audio_streams()}
-        self._reconcile_all()
+            self._streams = {s["id"]: s for s in self._pw.output_streams()}
+        self._apply_plan()
+
+    def _do_refresh_device(self):
+        # PipeWire/ALSA nodes lag the USB connect after a replug; poll up to ~3s.
+        # Wait for the mic AND the headphones — they're the same device, so
+        # acting on whichever registers first would drop the other's loopback.
+        mic = hp = None
+        for _ in range(10):
+            mic, hp = self._find_alsa()
+            if mic and hp:
+                break
+            time.sleep(0.3)
+        self.mic, self.hp = mic, hp
+        # The HP + mic loopbacks bind to ALSA nodes that change across a replug,
+        # so tear them down and respawn against the current device.
+        self._destroy_loopback(HP_LOOPBACK_KEY)
+        for mix_id in MIX_SINKS:
+            self._destroy_loopback(("mic", mix_id))
+        if self.hp:
+            self._spawn_loopback(
+                HP_LOOPBACK_KEY, PERSONAL_MIX_SINK, self.hp, HP_LOOPBACK_NODE,
+            )
+        self._apply_plan()   # respawn the mic sends against the new device
 
     def _do_remove_source(self, source_id):
+        # The source is already gone from self._sources, so the plan no longer
+        # includes its cell loopbacks (dropped here) and re-homes its app's
+        # streams onto the System catch-all.
+        self._apply_plan()
+        self._destroy_src_sink(source_id)
+
+    # ----- internal: declarative apply -----
+    def _apply_plan(self):
+        """Compute the desired routing (routing.plan) and reconcile the live
+        graph to match, touching only the deltas. This is the single reconcile
+        path — every source/cell/master/stream change funnels here. App streams
+        are moved onto their source's sink, whose monitor each cell loopback
+        carries into a mix, which is what makes a cell subtractive."""
         with self._lock:
-            keys = [
-                k for k in self._procs
-                if isinstance(k, tuple) and k and k[0] == source_id
-            ]
-        for k in keys:
-            self._destroy_loopback(k)
+            sources = SourceSet(self._sources)
+            streams = dict(self._streams)
+            state = dict(self._state)
+        p = plan(sources, state, self.mic, streams)
 
-    @staticmethod
-    def _sweep_stale_loopbacks():
-        try:
-            subprocess.run(
-                ["pkill", "-f", "pw-loopback.*openwave_loop_"],
-                capture_output=True, timeout=2,
-            )
-        except (FileNotFoundError, subprocess.SubprocessError):
-            return
-        time.sleep(0.2)  # give the kernel a beat to reap so we don't race
+        # Stream moves — only where the target sink changed.
+        for stream_id, sink in p.moves.items():
+            if self._move_targets.get(stream_id) != sink:
+                self._move_stream(stream_id, sink)
+                self._move_targets[stream_id] = sink
+        for stream_id in [s for s in self._move_targets if s not in p.moves]:
+            self._move_targets.pop(stream_id, None)   # stream is gone
 
-    # ----- internal -----
-    def _reconcile_all(self):
-        for source_id in (["mic"] + list(self._sources.keys())):
-            for mix_id in MIX_SINKS:
-                self._reconcile_cell(source_id, mix_id)
-
-    def _reconcile_cell(self, source_id, mix_id):
-        state = self._state.get(
-            f"{source_id}.{mix_id}", {"volume": 0.0, "muted": False}
-        )
-        if source_id == "mic":
-            self._reconcile_mic_cell(mix_id, state["volume"], state["muted"])
-        else:
-            self._reconcile_app_cell(source_id, mix_id, state["volume"], state["muted"])
-
-    def _reconcile_mic_cell(self, mix_id, volume, muted):
-        if not self.mic:
-            return
-        mix_sink = MIX_SINKS.get(mix_id)
-        if not mix_sink:
-            return
-        key = ("mic", mix_id)
-        node_name = f"openwave_loop_mic_to_{mix_id}"
-        if volume <= 0.0:
+        # Cell loopbacks — destroy the ones no longer wanted, spawn the new
+        # ones, re-volume only those whose effective level actually changed.
+        desired = {s.key: s for s in p.sends}
+        for key in [k for k in self._procs if _is_cell_key(k) and k not in desired]:
             self._destroy_loopback(key)
-            return
-        if key not in self._procs:
-            self._spawn_loopback(key, self.mic, mix_sink, node_name)
-        node_id = _node_id_by_name(node_name)
-        if node_id is not None:
-            _wpctl("set-volume", node_id, f"{volume:.3f}")
-            _wpctl("set-mute", node_id, "1" if muted else "0")
-
-    def _reconcile_app_cell(self, source_id, mix_id, volume, muted):
-        source = self._sources.get(source_id)
-        if not source:
-            return
-        mix_sink = MIX_SINKS.get(mix_id)
-        if not mix_sink:
-            return
-        match = source.get("match_app_name")
-        matching_stream_ids = {
-            sid for sid, s in self._streams.items() if s.get("app_name") == match
-        }
-        existing_keys = {
-            k for k in self._procs
-            if len(k) == 3 and k[0] == source_id and k[1] == mix_id
-        }
-
-        # Tear down loopbacks for streams that vanished or for a zeroed cell
-        for k in list(existing_keys):
-            if volume <= 0.0 or k[2] not in matching_stream_ids:
-                self._destroy_loopback(k)
-
-        if volume <= 0.0:
-            return
-
-        # Spawn (or update volume on) loopbacks for each currently-matching stream
-        for stream_id in matching_stream_ids:
-            key = (source_id, mix_id, stream_id)
-            node_name = f"openwave_loop_{source_id}_{mix_id}_{stream_id}"
-            stream_node_name = self._streams.get(stream_id, {}).get("node_name", "")
-            if not stream_node_name:
-                continue
+        for key, send in desired.items():
+            node_name = cell_loop(send.source_id, send.mix_id)
             if key not in self._procs:
-                self._spawn_loopback(key, stream_node_name, mix_sink, node_name)
-            node_id = _node_id_by_name(node_name)
-            if node_id is not None:
-                _wpctl("set-volume", node_id, f"{volume:.3f}")
-                _wpctl("set-mute", node_id, "1" if muted else "0")
+                self._spawn_loopback(key, send.capture, send.target, node_name)
+            if self._cell_state.get(key) != (send.volume, send.muted):
+                self._set_loop_volume(key, node_name, send.volume, send.muted)
+                self._cell_state[key] = (send.volume, send.muted)
