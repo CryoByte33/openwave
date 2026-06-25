@@ -4,6 +4,9 @@ import os
 import subprocess
 
 from . import pwnames, service
+from .pipewire import SubprocessPipeWire
+
+_pw = SubprocessPipeWire()
 
 UDEV_RULES = (
     # Wave XLR
@@ -159,39 +162,15 @@ MIX_SINKS = tuple(
 
 def _mix_sink_exists(name):
     """Return True if a PipeWire/Pulse sink with this name is already live."""
-    try:
-        r = subprocess.run(
-            ["pactl", "list", "short", "sinks"],
-            capture_output=True, text=True, timeout=3,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        return False
-    return any(line.split("\t", 2)[1] == name for line in r.stdout.splitlines() if "\t" in line)
+    return any(len(p) > 1 and p[1] == name for p in _pw.short_list("sinks"))
 
 
 def _create_mix_sink_live(name, description):
-    """Spawn a null sink immediately so it appears without a PipeWire restart."""
-    if _mix_sink_exists(name):
-        return
-    args = (
-        "{ "
-        "factory.name=support.null-audio-sink "
-        f"node.name={name} "
-        f'node.description="{description}" '
-        "media.class=Audio/Sink "
-        "audio.position=[FL FR] "
-        "object.linger=true "
-        "}"
-    )
-    try:
-        subprocess.run(
-            ["pw-cli", "create-node", "adapter", args],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (FileNotFoundError, subprocess.SubprocessError):
-        # pw-cli unavailable or PipeWire not reachable — the config file
-        # we just wrote will take effect on next PipeWire load.
-        pass
+    """Spawn a null sink immediately so it appears without a PipeWire restart.
+    No-op (and harmless) if the config file's sink is already live, or if
+    pw-cli can't reach PipeWire — the config takes effect on next load."""
+    if not _mix_sink_exists(name):
+        _pw.create_null_sink(name, description)
 
 
 def install_mixes():

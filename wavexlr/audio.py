@@ -20,7 +20,6 @@ advance for WEDGE_TIMEOUT seconds while pw-cat is supposedly running,
 we recycle it to release the shared USB clock.
 """
 
-import json
 import os
 import signal
 import subprocess
@@ -30,8 +29,9 @@ import logging
 
 log = logging.getLogger("wavexlr.audio")
 
-# The Wave XLR's ALSA node substring (covers both revisions) is owned by the
-# shared name vocabulary.
+# The Wave XLR's ALSA node substring (covers both revisions) lives in the shared
+# name vocabulary; the PipeWire adapter does the graph I/O.
+from .pipewire import SubprocessPipeWire
 from .pwnames import WAVE_XLR_MATCH as SOURCE_MATCH
 
 # Seconds without byte flow before we consider the keepalive wedged. At
@@ -59,31 +59,6 @@ STARTUP_GRACE = 1.0
 SIGTERM_GRACE = 0.5
 
 
-def _pw_dump():
-    """Get PipeWire object dump as JSON."""
-    try:
-        r = subprocess.run(
-            ["pw-dump", "--no-colors"], capture_output=True, text=True, timeout=5
-        )
-        if r.returncode == 0:
-            return json.loads(r.stdout)
-    except Exception:
-        pass
-    return []
-
-
-def _get_source_node_name():
-    """Get the full node name of the Wave XLR source."""
-    for obj in _pw_dump():
-        if obj.get("type") != "PipeWire:Interface:Node":
-            continue
-        props = obj.get("info", {}).get("props", {})
-        name = props.get("node.name", "")
-        if name.startswith("alsa_input") and SOURCE_MATCH in name:
-            return name
-    return None
-
-
 class AudioManager:
     """Keeps the Wave XLR capture stream active via a watched pw-cat subprocess.
 
@@ -91,7 +66,8 @@ class AudioManager:
     detects wedge ("alive but no data") and recycles the subprocess.
     """
 
-    def __init__(self, on_status_change=None):
+    def __init__(self, on_status_change=None, pw=None):
+        self._pw = pw or SubprocessPipeWire()
         self._running = False
         self._loop_thread = None
         self._cat_proc = None
@@ -147,26 +123,24 @@ class AudioManager:
         if reader and reader.is_alive():
             reader.join(timeout=2)
 
+    def _source_node(self):
+        """node.name of the Wave XLR ALSA source, or None if unplugged."""
+        return next(
+            (p[1] for p in self._pw.short_list("sources")
+             if len(p) > 1 and p[1].startswith("alsa_input") and SOURCE_MATCH in p[1]),
+            None,
+        )
+
     def _start_cat(self, source_name):
         """Spawn pw-cat with stdout piped so we can monitor byte flow."""
         self._kill_cat()
         self._last_data_at = time.monotonic()
-        self._cat_proc = subprocess.Popen(
-            [
-                "pw-cat", "--record",
-                "--target", source_name,
-                "--channels", "1",
-                "--format", "s16",
-                "--rate", "48000",
-                "--latency", "200ms",
-                "-",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            # New process group so SIGKILL on the leader cleans up any
-            # children too. start_new_session=True is the portable spelling.
-            start_new_session=True,
+        # Own process group so a group-kill reaps it on a wedge (see _kill_cat).
+        self._cat_proc = self._pw.spawn_capture(
+            source_name, rate=48000, latency="200ms", new_session=True,
         )
+        if self._cat_proc is None:
+            return
         self._reader_thread = threading.Thread(
             target=self._drain, args=(self._cat_proc,), daemon=True
         )
@@ -234,7 +208,7 @@ class AudioManager:
                     )
                     self._cat_proc = None
 
-                source_name = _get_source_node_name()
+                source_name = self._source_node()
                 if not source_name:
                     self._update_status(False, False)
                     time.sleep(5)

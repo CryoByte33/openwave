@@ -213,3 +213,24 @@ class SubprocessPipeWire:
             )
         except (FileNotFoundError, OSError):
             return None
+
+    def spawn_capture(self, target, rate, channels=1, fmt="s16",
+                      latency=None, new_session=False):
+        """Spawn `pw-cat --record` from `target` with stdout piped so the caller
+        can read the byte/sample flow. new_session=True puts it in its own
+        process group (the caller kills the group on wedge); otherwise it
+        inherits pdeathsig. Returns the Popen, or None if pw-cat is absent."""
+        cmd = ["pw-cat", "--record", "--target", target,
+               "--channels", str(channels), "--format", fmt, "--rate", str(rate)]
+        if latency:
+            cmd += ["--latency", latency]
+        cmd.append("-")
+        kw = {"stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL}
+        if new_session:
+            kw["start_new_session"] = True  # own group so a group-kill reaps it
+        else:
+            kw["preexec_fn"] = _set_pdeathsig
+        try:
+            return subprocess.Popen(cmd, **kw)
+        except (FileNotFoundError, OSError):
+            return None
