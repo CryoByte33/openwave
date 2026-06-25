@@ -32,6 +32,11 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._updating_ui = False
         self.controller = None      # built after the UI; guards early handlers
         self._stream_poll_id = None
+        # Live-update throttle for the matrix cell + master sliders (the device
+        # gain/HP sliders throttle inside the controller instead).
+        self._thr_pending = {}   # name -> latest value awaiting send
+        self._thr_tid = {}       # name -> GLib timeout id (None = idle)
+        self._thr_send = {}      # name -> setter callable
         self._sources = SourceSet.load()
 
         self._build_ui()
@@ -536,6 +541,32 @@ class WaveXLRWindow(Adw.ApplicationWindow):
     def _on_cell_mute_toggled(self, _cell, muted, source_id, mix_id):
         cur = self.mixer.get_cell(source_id, mix_id)
         self.mixer.set_cell(source_id, mix_id, cur["volume"], muted)
+
+    # Live-update throttle for the matrix sliders: send on the leading edge,
+    # then at most every _THROTTLE_MS while the value keeps changing, plus a
+    # trailing send — so dragging a cell/master updates the mix in real time
+    # without flooding the mixer.
+    _THROTTLE_MS = 80
+
+    def _throttle(self, name, value, send_fn):
+        self._thr_pending[name] = value
+        self._thr_send[name] = send_fn
+        if self._thr_tid.get(name) is None:
+            self._thr_flush(name)
+            self._thr_tid[name] = GLib.timeout_add(self._THROTTLE_MS, self._thr_tick, name)
+
+    def _thr_tick(self, name):
+        if name in self._thr_pending:
+            self._thr_flush(name)
+            return True  # keep ticking while values are still arriving
+        self._thr_tid[name] = None
+        return False
+
+    def _thr_flush(self, name):
+        if name not in self._thr_pending:
+            return
+        value = self._thr_pending.pop(name)
+        self._thr_send[name](value)
 
 
 class WaveXLRApp(Adw.Application):
