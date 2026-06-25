@@ -9,9 +9,9 @@ import logging
 import os
 import signal
 import sys
-import threading
 
-from .device import WaveXLR, WaveXLRMk2, detect_pid, PID_MK2
+from .devicecontroller import DeviceController
+from .scheduler import GLibScheduler
 from .meter import MeterMonitor
 from .mixer import Mixer, SYSTEM_SOURCE
 from .pwnames import src_sink
@@ -27,20 +27,11 @@ class WaveXLRWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs, title="OpenWave", default_width=1100, default_height=620)
         self.set_size_request(900, 520)
-        self.xlr = WaveXLR()
+        # Set during render() so the device widgets' setters don't fire their
+        # handlers back at the controller (feedback guard).
         self._updating_ui = False
-        self._last_state = None
-        self._poll_id = None
+        self.controller = None      # built after the UI; guards early handlers
         self._stream_poll_id = None
-        self._reconnect_id = None   # hotplug: GLib timeout polling for the device
-        self._connecting = False    # guards overlapping _try_connect attempts
-        # Live-update throttle state for the device sliders (gain, hp).
-        self._thr_pending = {}   # name -> latest value awaiting send
-        self._thr_tid = {}       # name -> GLib timeout id (None = idle)
-        self._thr_send = {}      # name -> setter callable
-        # HP detent dB list when the device has a non-linear (stepped) HP
-        # control; None = continuous dB slider. Set in _apply_caps.
-        self._hp_detents = None
         self._sources = SourceSet.load()
 
         self._build_ui()
@@ -53,7 +44,14 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._wire_matrix_cells()
         self._start_meters()
         self._start_stream_poll()
-        self._try_connect()
+        # The controller owns the device connection + the device-pane state, and
+        # rebuilds the mic/HP loopbacks on each (re)connect.
+        self.controller = DeviceController(
+            GLibScheduler(), on_view=self._render,
+            on_connected=self.mixer.refresh_device,
+            logger=logging.getLogger("wavexlr.app"),
+        )
+        self.controller.start()
 
     def _build_ui(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -66,7 +64,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         header.set_title_widget(self.status_label)
 
         refresh_btn = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Reconnect")
-        refresh_btn.connect("clicked", lambda _: self._try_connect())
+        refresh_btn.connect("clicked", lambda _: self.controller and self.controller.connect())
         header.pack_end(refresh_btn)
 
         # Sidebar toggle (placed at the end so it sits next to the close button)
@@ -303,126 +301,26 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             err.add_response("ok", "OK")
             err.choose(self, None, lambda d, r: d.choose_finish(r))
 
-    def _usb_async(self, fn, on_done=None, on_error=None):
-        """Run fn in a background thread; call on_done/on_error on GTK thread."""
-        def _worker():
-            try:
-                result = fn()
-                if on_done:
-                    GLib.idle_add(on_done, result)
-            except Exception as e:
-                if on_error:
-                    GLib.idle_add(on_error, e)
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _try_connect(self):
-        if self._connecting:
-            return
-        self._connecting = True
-        self.status_label.set_label("Connecting...")
-        def _connect():
-            self.xlr.disconnect()
-            # Pick the backend for whichever Wave XLR is attached.
-            if detect_pid() == PID_MK2:
-                if not isinstance(self.xlr, WaveXLRMk2):
-                    self.xlr = WaveXLRMk2()
-            elif not isinstance(self.xlr, WaveXLR):
-                self.xlr = WaveXLR()
-            self.xlr.connect()
-            info = {}
-            try:
-                info = self.xlr.read_device_info()
-            except Exception:
-                pass
-            return {"state": self.xlr.get_all(), "info": info}
-        def _done(result):
-            self._connecting = False
-            self._stop_reconnect()
-            self.status_label.set_label("OpenWave")
-            self.status_label.remove_css_class("dim-label")
-            self._apply_caps()
-            self._apply_state(result["state"])
-            info = result["info"]
-            self.fw_label.set_label(info.get("fw_version", "—"))
-            self.api_label.set_label(info.get("api_version", "—"))
-            self.serial_label.set_label(info.get("serial", "—"))
-            # Rebuild the mic/HP loopbacks against the (possibly hotplugged) device.
-            self.mixer.refresh_device()
-            self._start_polling()
-        def _fail(e):
-            self._connecting = False
-            logging.getLogger("wavexlr.app").warning("Connect failed: %r", e)
-            self.status_label.set_label("Disconnected")
+    def _render(self, view):
+        """Render a DeviceView onto the device pane. _updating_ui guards the
+        widget setters so they don't fire their handlers back at the controller."""
+        self.status_label.set_label(view.status)
+        if not view.connected:
             self.status_label.add_css_class("dim-label")
-            self._start_reconnect()
-        self._usb_async(_connect, _done, _fail)
-
-    def _start_reconnect(self):
-        """Poll for the Wave XLR coming back (hotplug) and reconnect when it does."""
-        if self._reconnect_id is None:
-            self._reconnect_id = GLib.timeout_add_seconds(2, self._reconnect_tick)
-
-    def _reconnect_tick(self):
-        if self.xlr.connected:
-            self._reconnect_id = None
-            return False
-        if not self._connecting and detect_pid() is not None:
-            self._try_connect()
-        return True
-
-    def _stop_reconnect(self):
-        if self._reconnect_id is not None:
-            GLib.source_remove(self._reconnect_id)
-            self._reconnect_id = None
-
-    def _start_polling(self):
-        """Start 10 Hz polling to sync hardware state."""
-        if self._poll_id:
-            GLib.source_remove(self._poll_id)
-        self._poll_id = GLib.timeout_add(100, self._poll_tick)
-
-    def _stop_polling(self):
-        if self._poll_id:
-            GLib.source_remove(self._poll_id)
-            self._poll_id = None
-
-    def _poll_tick(self):
-        """Called every 100ms — read device state in background."""
-        if not self.xlr.connected:
-            self._poll_id = None
-            return False  # stop polling
-        # Only poll if not already busy with a user-initiated write
-        self._usb_async(self.xlr.get_all, self._on_poll_result, self._on_poll_error)
-        return True  # keep polling
-
-    def _on_poll_result(self, state):
-        if state != self._last_state:
-            self._apply_state(state)
-
-    def _on_poll_error(self, e):
-        self.status_label.set_label("Disconnected")
-        self.status_label.add_css_class("dim-label")
-        self.xlr.disconnect()
-        self._stop_polling()
-        self._start_reconnect()
-
-    def _apply_caps(self):
-        """Enable/disable device-specific controls based on backend support."""
-        lowz = getattr(self.xlr, "supports_low_impedance", True)
-        self.lowz_row.set_sensitive(lowz)
+            return
+        self.status_label.remove_css_class("dim-label")
+        self._updating_ui = True
+        caps = view.caps
+        self.lowz_row.set_sensitive(caps.supports_low_impedance)
         self.lowz_row.set_subtitle(
-            "For low impedance headphones" if lowz
+            "For low impedance headphones" if caps.supports_low_impedance
             else "Not yet supported on Wave XLR MK.2"
         )
-        self.knob_row.set_visible(getattr(self.xlr, "supports_volume_select", True))
-
-        # Configure the HP slider: stepped detents (MK.2) or continuous dB (mk1).
-        self._hp_detents = getattr(self.xlr, "hp_detents", None)
+        self.knob_row.set_visible(caps.supports_volume_select)
         adj = self.hp_scale.get_adjustment()
-        self._updating_ui = True
-        if self._hp_detents:
+        if caps.hp_detents:
             adj.set_lower(0)
-            adj.set_upper(len(self._hp_detents) - 1)
+            adj.set_upper(len(caps.hp_detents) - 1)
             adj.set_step_increment(1)
             adj.set_page_increment(4)
         else:
@@ -430,98 +328,38 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             adj.set_upper(0.0)
             adj.set_step_increment(0.5)
             adj.set_page_increment(2.0)
+        self.mute_row.set_active(view.muted)
+        self.gain_scale.set_value(view.gain_raw)
+        self.gain_label.set_label(view.gain_label)
+        self.hp_scale.set_value(view.hp_value)
+        self.hp_label.set_label(view.hp_label)
+        self.lowz_row.set_active(view.low_impedance)
+        self.knob_label.set_label(view.knob_label)
+        self.fw_label.set_label(view.fw_version)
+        self.api_label.set_label(view.api_version)
+        self.serial_label.set_label(view.serial)
         self._updating_ui = False
 
-    def _hp_detent_index(self, db):
-        """Nearest HP detent index for a dB value (detent mode only)."""
-        return min(range(len(self._hp_detents)),
-                   key=lambda i: abs(self._hp_detents[i] - db))
-
-    def _apply_state(self, state):
-        """Update UI from device state dict (must be called on GTK thread)."""
-        self._updating_ui = True
-        self._last_state = state
-        self.mute_row.set_active(state["mute"])
-        self.gain_scale.set_value(state["gain_raw"])
-        self.gain_label.set_label(self.xlr.format_gain(state["gain_raw"]))
-        if self._hp_detents:
-            idx = self._hp_detent_index(state["hp_volume_db"])
-            self.hp_scale.set_value(idx)
-            self.hp_label.set_label(f"{self._hp_detents[idx]:.1f} dB")
-        else:
-            self.hp_scale.set_value(state["hp_volume_db"])
-            self.hp_label.set_label(f"{state['hp_volume_db']:.1f} dB")
-        self.lowz_row.set_active(state["low_impedance"])
-        self.knob_label.set_label("Headphones" if state["volume_select"] == "hp" else "Gain")
-        self._updating_ui = False
-
-    def _on_usb_error(self, e):
-        self.status_label.set_label("Disconnected")
-        self.status_label.add_css_class("dim-label")
-        self.xlr.disconnect()
-        self._stop_polling()
-        self._start_reconnect()
+    def _live(self):
+        """True when a user control change should be forwarded to the device."""
+        return not self._updating_ui and self.controller is not None \
+            and self.controller.connected
 
     def _on_mute_changed(self, row, _pspec):
-        if self._updating_ui or not self.xlr.connected:
-            return
-        muted = row.get_active()
-        self._usb_async(lambda: self.xlr.set_mute(muted), on_error=self._on_usb_error)
-
-    # Live-update throttle: send on the leading edge, then at most every
-    # _THROTTLE_MS while the value keeps changing, plus a trailing send — so
-    # sliders/wheel move the device in real time without flooding it.
-    _THROTTLE_MS = 80
-
-    def _throttle(self, name, value, send_fn):
-        self._thr_pending[name] = value
-        self._thr_send[name] = send_fn
-        if self._thr_tid.get(name) is None:
-            self._thr_flush(name)
-            self._thr_tid[name] = GLib.timeout_add(self._THROTTLE_MS, self._thr_tick, name)
-
-    def _thr_tick(self, name):
-        if name in self._thr_pending:
-            self._thr_flush(name)
-            return True  # keep ticking while values are still arriving
-        self._thr_tid[name] = None
-        return False
-
-    def _thr_flush(self, name):
-        if name not in self._thr_pending:
-            return
-        value = self._thr_pending.pop(name)
-        self._thr_send[name](value)   # send_fn is responsible for any threading
-
-    def _send_gain(self, val):
-        self._usb_async(lambda: self.xlr.set_gain_raw(val), on_error=self._on_usb_error)
-
-    def _send_hp(self, db):
-        self._usb_async(lambda: self.xlr.set_hp_volume_db(db), on_error=self._on_usb_error)
+        if self._live():
+            self.controller.set_mute(row.get_active())
 
     def _on_gain_changed(self, scale):
-        if self._updating_ui or not self.xlr.connected:
-            return
-        val = int(scale.get_value())
-        self.gain_label.set_label(self.xlr.format_gain(val))
-        self._throttle("gain", val, self._send_gain)
+        if self._live():
+            self.gain_label.set_label(self.controller.set_gain(int(scale.get_value())))
 
     def _on_hp_changed(self, scale):
-        if self._updating_ui or not self.xlr.connected:
-            return
-        if self._hp_detents:
-            idx = max(0, min(len(self._hp_detents) - 1, int(round(scale.get_value()))))
-            db = self._hp_detents[idx]
-        else:
-            db = scale.get_value()
-        self.hp_label.set_label(f"{db:.1f} dB")
-        self._throttle("hp", db, self._send_hp)
+        if self._live():
+            self.hp_label.set_label(self.controller.set_hp(scale.get_value()))
 
     def _on_lowz_changed(self, row, _pspec):
-        if self._updating_ui or not self.xlr.connected:
-            return
-        enabled = row.get_active()
-        self._usb_async(lambda: self.xlr.set_low_impedance(enabled), on_error=self._on_usb_error)
+        if self._live():
+            self.controller.set_low_impedance(row.get_active())
 
     def _wire_source_master(self, cell, source_id):
         """Bind a source row's master fader/mute to the mixer's per-source master
@@ -793,12 +631,8 @@ class WaveXLRApp(Adw.Application):
         self.hold()
 
     def _toggle_mute(self):
-        if self._window and self._window.xlr.connected:
-            current = self._window._last_state and self._window._last_state.get("mute", False)
-            self._window._usb_async(
-                lambda: self._window.xlr.set_mute(not current),
-                on_error=self._window._on_usb_error,
-            )
+        if self._window and self._window.controller is not None:
+            self._window.controller.toggle_mute()
 
     def _quit_app(self):
         self.release()
@@ -864,10 +698,8 @@ class WaveXLRApp(Adw.Application):
         win.present()
 
     def do_shutdown(self):
-        if self._window:
-            self._window._stop_polling()
-            self._window._stop_reconnect()
-            self._window.xlr.disconnect()
+        if self._window and self._window.controller is not None:
+            self._window.controller.stop()
         Adw.Application.do_shutdown(self)
 
 
