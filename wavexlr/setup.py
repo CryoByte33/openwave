@@ -3,7 +3,7 @@
 import os
 import subprocess
 
-from . import service
+from . import pwnames, service
 
 UDEV_RULES = (
     # Wave XLR
@@ -150,10 +150,10 @@ def install_wireplumber():
     return True
 
 
-MIX_SINKS = (
-    ("openwave_personal_mix", "OpenWave Personal Mix"),
-    ("openwave_chat_mix", "OpenWave Chat Mix"),
-    ("openwave_record_mix", "OpenWave Record Mix"),
+# (node name, description) for each mix-bus sink, from the shared vocabulary.
+MIX_SINKS = tuple(
+    (pwnames.MIX_SINKS[m], pwnames.MIX_SINK_DESCRIPTIONS[m])
+    for m in ("personal", "chat", "record")
 )
 
 

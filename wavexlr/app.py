@@ -13,7 +13,8 @@ import threading
 
 from .device import WaveXLR, WaveXLRMk2, detect_pid, PID_MK2
 from .meter import MeterMonitor
-from .mixer import Mixer, SYSTEM_SOURCE, src_sink_name
+from .mixer import Mixer, SYSTEM_SOURCE
+from .pwnames import src_sink
 from .mixmatrix import MixMatrix
 from .sourcedialog import AddSourceDialog
 from . import setup, service, sources as sources_module
@@ -595,7 +596,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             )
         # System level = its source sink's monitor (aggregate of unmatched apps).
         self.meter.start(
-            SYSTEM_SOURCE, src_sink_name(SYSTEM_SOURCE),
+            SYSTEM_SOURCE, src_sink(SYSTEM_SOURCE),
             lambda level: self._set_source_level(SYSTEM_SOURCE, level),
         )
         for source_id in self._sources.keys():

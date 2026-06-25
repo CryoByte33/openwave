@@ -25,6 +25,12 @@ import threading
 import time
 from threading import Event, Lock
 
+from .pwnames import (
+    CAPTURE_SOURCE_NAMES, HP_LOOPBACK_NODE, LOOPBACK_SWEEP, MIX_DEVICES,
+    MIX_SINKS, PERSONAL_MIX_SINK, WAVE_XLR_MATCH, cap_node, capture_src_cap,
+    cell_loop, is_ours, src_sink,
+)
+
 _log = logging.getLogger(__name__)
 
 # Linux-only: make spawned children receive SIGTERM if our process dies.
@@ -47,36 +53,9 @@ def _set_pdeathsig():
 
 CONFIG_PATH = os.path.expanduser("~/.config/openwave/mixes.json")
 
-MIX_SINKS = {
-    "personal": "openwave_personal_mix",
-    "chat":     "openwave_chat_mix",
-    "record":   "openwave_record_mix",
-}
-PERSONAL_MIX_SINK = "openwave_personal_mix"
+# Key into self._procs for the always-on Personal→headphones loopback (not a
+# node name — see pwnames.HP_LOOPBACK_NODE for that).
 HP_LOOPBACK_KEY = "_personal_to_hp"
-HP_LOOPBACK_NODE = "openwave_loop_personal_to_hp"
-
-# Chat and Record are submix buses, each exposed to apps (Discord/OBS) as a
-# first-class, app-selectable capture device: a pw-loopback captures the bus
-# sink's monitor and presents it as a media.class=Audio/Source node. (A raw
-# sink monitor isn't shown in app mic pickers; Audio/Source forwards audio and
-# is listable, whereas Audio/Source/Virtual has no output ports / no forwarding
-# on PW 1.6.7.) The matrix routes sources into the sink. Personal isn't here —
-# you hear it via the headphones, you don't capture it.
-# Maps mix_id -> (sink_description, source_node_name, source_description).
-MIX_DEVICES = {
-    "chat":   ("OpenWave Chat Mix",   "openwave_chat",   "OpenWave Chat"),
-    "record": ("OpenWave Record Mix", "openwave_record", "OpenWave Record"),
-}
-
-
-def src_sink_name(source_id):
-    """Per-source virtual sink. An app source's streams are *moved* onto this
-    sink (PipeWire target.object); its monitor is the source's single stable
-    output that the matrix routes into the mixes. This is what makes a cell
-    subtractive — the app has no path to the mixes except through here."""
-    return f"openwave_src_{source_id}"
-
 
 # Catch-all source: every app stream not matched by a user-defined source is
 # moved here, so everything is routable instead of leaking to the default sink.
@@ -98,12 +77,12 @@ def find_wave_xlr_alsa():
     """Return (mic_node_name, hp_node_name); either may be None if unplugged."""
     mic = next(
         (p[1] for p in _pactl_short("sources")
-         if len(p) > 1 and p[1].startswith("alsa_input") and "Wave_XLR" in p[1]),
+         if len(p) > 1 and p[1].startswith("alsa_input") and WAVE_XLR_MATCH in p[1]),
         None,
     )
     hp = next(
         (p[1] for p in _pactl_short("sinks")
-         if len(p) > 1 and p[1].startswith("alsa_output") and "Wave_XLR" in p[1]),
+         if len(p) > 1 and p[1].startswith("alsa_output") and WAVE_XLR_MATCH in p[1]),
         None,
     )
     return mic, hp
@@ -184,7 +163,7 @@ def list_audio_streams():
         app = props.get("application.name") or props.get("node.name") or "Unknown"
         # Skip our own loopbacks
         node_name = props.get("node.name", "")
-        if node_name.startswith("openwave_"):
+        if is_ours(node_name):
             continue
         out.append({
             "id": obj["id"],
@@ -295,7 +274,7 @@ class Mixer:
         """
         if key in self._procs:
             return
-        capture_node_name = f"{node_name}_cap"
+        capture_node_name = cap_node(node_name)
         try:
             proc = subprocess.Popen(
                 [
@@ -411,7 +390,7 @@ class Mixer:
         the _sinks_created set prevents a registration race from making dupes."""
         if source_id in self._sinks_created:
             return
-        name = src_sink_name(source_id)
+        name = src_sink(source_id)
         if _node_id_by_name(name, retries=3) is not None:
             self._sinks_created.add(source_id)  # adopt a leaked one from before
             return
@@ -422,7 +401,7 @@ class Mixer:
 
     def _destroy_src_sink(self, source_id):
         self._sinks_created.discard(source_id)
-        nid = _node_id_by_name(src_sink_name(source_id), retries=1)
+        nid = _node_id_by_name(src_sink(source_id), retries=1)
         if nid is not None:
             subprocess.run(["pw-cli", "destroy", nid], capture_output=True, text=True)
 
@@ -448,7 +427,7 @@ class Mixer:
             proc = subprocess.Popen(
                 ["pw-loopback",
                  "--capture-props={ stream.capture.sink=true "
-                 f"target.object={sink} node.name=openwave_loop_{mix_id}_src_cap "
+                 f"target.object={sink} node.name={capture_src_cap(mix_id)} "
                  "node.passive=true audio.position=[FL FR] }",
                  "--playback-props={ media.class=Audio/Source "
                  f"node.name={src_name} node.description=\"{src_desc}\" "
@@ -485,7 +464,7 @@ class Mixer:
         name_to_src = {s.get("match_app_name"): sid for sid, s in sources.items()}
         for stream_id, info in streams.items():
             src = name_to_src.get(info.get("app_name"))
-            self._move_stream(stream_id, src_sink_name(src if src is not None else SYSTEM_SOURCE))
+            self._move_stream(stream_id, src_sink(src if src is not None else SYSTEM_SOURCE))
 
     # Below this, the slider snaps to 0 — sub-1% values keep the loopback alive
     # at imperceptible-but-not-silent volume and confuse "I put it back to 0".
@@ -670,7 +649,7 @@ class Mixer:
     def _sweep_stale_loopbacks():
         try:
             subprocess.run(
-                ["pkill", "-f", "pw-loopback.*openwave_loop_"],
+                ["pkill", "-f", LOOPBACK_SWEEP],
                 capture_output=True, timeout=2,
             )
         except (FileNotFoundError, subprocess.SubprocessError):
@@ -692,7 +671,7 @@ class Mixer:
         for line in r.stdout.splitlines():
             if "module-remap-source" not in line:
                 continue
-            if "openwave_chat" in line or "openwave_record" in line:
+            if any(name in line for name in CAPTURE_SOURCE_NAMES):
                 idx = line.split("\t")[0]
                 subprocess.run(["pactl", "unload-module", idx], capture_output=True)
 
@@ -730,7 +709,7 @@ class Mixer:
             return
         volume, muted = self._apply_master("mic", volume, muted)
         key = ("mic", mix_id)
-        node_name = f"openwave_loop_mic_to_{mix_id}"
+        node_name = cell_loop("mic", mix_id)
         if volume <= 0.0:
             self._destroy_loopback(key)
             return
@@ -750,10 +729,10 @@ class Mixer:
             return
         volume, muted = self._apply_master(source_id, volume, muted)
         key = (source_id, mix_id)
-        node_name = f"openwave_loop_{source_id}_to_{mix_id}"
+        node_name = cell_loop(source_id, mix_id)
         if volume <= 0.0:
             self._destroy_loopback(key)
             return
         if key not in self._procs:
-            self._spawn_loopback(key, src_sink_name(source_id), mix_sink, node_name)
+            self._spawn_loopback(key, src_sink(source_id), mix_sink, node_name)
         self._set_loop_volume(key, node_name, volume, muted)

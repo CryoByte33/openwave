@@ -30,10 +30,9 @@ import logging
 
 log = logging.getLogger("wavexlr.audio")
 
-# Substring of the PipeWire node name. Kept loose ("Wave_XLR" rather than the
-# full Elgato_Systems_Elgato_Wave_XLR prefix) so it matches both the Wave XLR
-# and the Wave XLR mk 2 regardless of their exact USB string descriptors.
-SOURCE_MATCH = "Wave_XLR"
+# The Wave XLR's ALSA node substring (covers both revisions) is owned by the
+# shared name vocabulary.
+from .pwnames import WAVE_XLR_MATCH as SOURCE_MATCH
 
 # Seconds without byte flow before we consider the keepalive wedged. At
 # 48 kHz mono s16 the healthy rate is ~96 kB/s, so even 1s of silence is
