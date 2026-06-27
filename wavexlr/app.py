@@ -16,7 +16,7 @@ from .meter import MeterMonitor
 from .mixer import Mixer, SYSTEM_SOURCE
 from .pwnames import src_sink
 from .mixmatrix import MixMatrix
-from .sourcedialog import AddSourceDialog
+from .sourcedialog import AddSourceDialog, PickAppsDialog
 from . import setup, service
 from .sources import Source, SourceSet
 
@@ -46,7 +46,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.mixer.start()
         self.meter = MeterMonitor()
         self._meter_targets = {}
-        self._wire_matrix_cells()
+        self._restore_strips()
         self._start_meters()
         self._start_stream_poll()
         # The controller owns the device connection + the device-pane state, and
@@ -112,12 +112,12 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         )
         self.matrix.add_mix(
             "chat", title="Chat Mix",
-            subtitle="To voice apps (v0.3.0)",
+            subtitle="To voice apps as “OpenWave Chat”",
             icon_name="system-users-symbolic",
         )
         self.matrix.add_mix(
             "record", title="Record Mix",
-            subtitle="To OBS / recording (v0.3.0)",
+            subtitle="To OBS as “OpenWave Record”",
             icon_name="media-record-symbolic",
         )
 
@@ -126,7 +126,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             icon_name="audio-input-microphone-symbolic",
             has_level=True,
         )
-        self._wire_source_master(self.mic_source, "mic")
+        self._wire_strip(self.mic_source, "mic")
 
         # System catch-all: every app not added as its own source is routed here.
         self.system_source = self.matrix.add_source(
@@ -134,21 +134,24 @@ class WaveXLRWindow(Adw.ApplicationWindow):
             icon_name="computer-symbolic",
             has_level=True,
         )
-        self._wire_source_master(self.system_source, SYSTEM_SOURCE)
+        self._wire_strip(self.system_source, SYSTEM_SOURCE)
 
-        # User-defined app sources (persisted)
+        # User-defined channels (persisted) — each binds one app or a group.
         for source in self._sources:
-            cell = self.matrix.add_source(
+            strip = self.matrix.add_source(
                 source.id,
                 name=source.name,
                 icon_name=source.icon_name,
                 has_level=True,
                 removable=True,
+                members=source.members,
+                is_group=source.is_group,
             )
-            self._wire_source_master(cell, source.id)
+            self._wire_strip(strip, source.id, removable=True)
 
         self.matrix.connect("add-source-clicked", self._on_add_source_clicked)
         self.matrix.connect("remove-source-clicked", self._on_remove_source_clicked)
+        self.matrix.connect("sources-reordered", self._on_sources_reordered)
 
         # --- Sidebar: device controls -----------------------------------------
         sidebar_scroll = Gtk.ScrolledWindow(
@@ -169,26 +172,8 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.split.set_sidebar(sidebar_scroll)
 
     def _build_device_pane(self, parent):
-        """Populate the right-hand column with Audio / Mic / HP / Device Info groups."""
-        # --- Audio fix status ---
-        status_group = Adw.PreferencesGroup(title="Audio")
-        parent.append(status_group)
-
-        self.audio_status_row = Adw.ActionRow(
-            title="Capture Fix",
-            subtitle="Keeps mic capture active to prevent the race condition"
-        )
-        self.audio_status_icon = Gtk.Image(icon_name="emblem-ok-symbolic")
-        self.audio_status_icon.add_css_class("dim-label")
-        self.audio_status_row.add_suffix(self.audio_status_icon)
-
-        self.uninstall_btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Uninstall capture fix")
-        self.uninstall_btn.add_css_class("flat")
-        self.uninstall_btn.connect("clicked", self._on_uninstall_clicked)
-        self.audio_status_row.add_suffix(self.uninstall_btn)
-
-        status_group.add(self.audio_status_row)
-
+        """Microphone / Headphones / Device groups, then the Audio Service status
+        pinned at the bottom (highlighted when the service isn't running)."""
         # --- Mic controls ---
         mic_group = Adw.PreferencesGroup(title="Microphone")
         parent.append(mic_group)
@@ -227,7 +212,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         parent.append(hp_group)
 
         hp_vol_row = Adw.ActionRow(title="Volume")
-        self.hp_label = Gtk.Label(label="0.0 dB", width_chars=10, xalign=1)
+        self.hp_label = Gtk.Label(label="—", width_chars=5, xalign=1)
         self.hp_label.add_css_class("monospace")
         hp_vol_row.add_suffix(self.hp_label)
         hp_group.add(hp_vol_row)
@@ -248,40 +233,70 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.lowz_row = lowz_row
         hp_group.add(lowz_row)
 
-        # --- Device info ---
-        info_group = Adw.PreferencesGroup(title="Device Info")
+        # --- Device info (folded behind an ⓘ so it doesn't crowd the controls) ---
+        info_group = Adw.PreferencesGroup(title="Device")
         parent.append(info_group)
 
-        self.fw_row = Adw.ActionRow(title="Firmware")
-        self.fw_label = Gtk.Label(label="—")
-        self.fw_label.add_css_class("dim-label")
-        self.fw_row.add_suffix(self.fw_label)
-        info_group.add(self.fw_row)
+        info_row = Adw.ActionRow(title="Wave XLR", subtitle="Firmware, API, serial")
+        info_btn = Gtk.MenuButton(
+            icon_name="dialog-information-symbolic", valign=Gtk.Align.CENTER,
+            tooltip_text="Device details")
+        info_btn.add_css_class("flat")
+        info_row.add_suffix(info_btn)
+        info_group.add(info_row)
 
-        self.api_row = Adw.ActionRow(title="API Version")
-        self.api_label = Gtk.Label(label="—")
-        self.api_label.add_css_class("dim-label")
-        self.api_row.add_suffix(self.api_label)
-        info_group.add(self.api_row)
+        pop = Gtk.Popover()
+        info_btn.set_popover(pop)
+        grid = Gtk.Grid(
+            row_spacing=8, column_spacing=16,
+            margin_start=14, margin_end=14, margin_top=14, margin_bottom=14,
+        )
+        pop.set_child(grid)
+        self.fw_label = Gtk.Label(label="—", xalign=1)
+        self.api_label = Gtk.Label(label="—", xalign=1)
+        self.serial_label = Gtk.Label(label="—", xalign=1)
+        for r, (title, lbl) in enumerate((
+                ("Firmware", self.fw_label),
+                ("API Version", self.api_label),
+                ("Serial", self.serial_label))):
+            key = Gtk.Label(label=title, xalign=0)
+            key.add_css_class("dim-label")
+            lbl.add_css_class("monospace")
+            grid.attach(key, 0, r, 1, 1)
+            grid.attach(lbl, 1, r, 1, 1)
 
-        self.serial_row = Adw.ActionRow(title="Serial")
-        self.serial_label = Gtk.Label(label="—")
-        self.serial_label.add_css_class("dim-label")
-        self.serial_row.add_suffix(self.serial_label)
-        info_group.add(self.serial_row)
+        # --- Audio service status — pinned at the bottom, highlighted when down ---
+        status_group = Adw.PreferencesGroup(title="Audio Service")
+        parent.append(status_group)
+
+        self.audio_status_row = Adw.ActionRow(
+            title="Capture Fix",
+            subtitle="Keeps mic capture active to prevent the race condition")
+        self.audio_status_icon = Gtk.Image(icon_name="emblem-ok-symbolic")
+        self.audio_status_icon.add_css_class("dim-label")
+        self.audio_status_row.add_suffix(self.audio_status_icon)
+
+        self.uninstall_btn = Gtk.Button(
+            icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+            tooltip_text="Uninstall capture fix")
+        self.uninstall_btn.add_css_class("flat")
+        self.uninstall_btn.connect("clicked", self._on_uninstall_clicked)
+        self.audio_status_row.add_suffix(self.uninstall_btn)
+        status_group.add(self.audio_status_row)
 
     def _update_service_status(self):
-        """Check if the audio service is running."""
-        active = service.is_running()
-
-        if active:
+        """Reflect whether the audio service is running; highlight the row if not."""
+        if service.is_running():
             self.audio_status_icon.set_from_icon_name("emblem-ok-symbolic")
             self.audio_status_icon.remove_css_class("dim-label")
             self.audio_status_row.set_subtitle("Audio service running")
+            self.audio_status_row.remove_css_class("openwave-service-down")
             self.uninstall_btn.set_visible(True)
         else:
             self.audio_status_icon.set_from_icon_name("dialog-warning-symbolic")
+            self.audio_status_icon.remove_css_class("dim-label")
             self.audio_status_row.set_subtitle("Audio service not running")
+            self.audio_status_row.add_css_class("openwave-service-down")
             self.uninstall_btn.set_visible(False)
 
     def _on_uninstall_clicked(self, btn):
@@ -337,13 +352,23 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.gain_scale.set_value(view.gain_raw)
         self.gain_label.set_label(view.gain_label)
         self.hp_scale.set_value(view.hp_value)
-        self.hp_label.set_label(view.hp_label)
+        self.hp_label.set_label(self._hp_percent(view.hp_value))
         self.lowz_row.set_active(view.low_impedance)
         self.knob_label.set_label(view.knob_label)
         self.fw_label.set_label(view.fw_version)
         self.api_label.set_label(view.api_version)
         self.serial_label.set_label(view.serial)
         self._updating_ui = False
+
+    def _hp_percent(self, value):
+        """Headphone volume as 0–100% of the slider's range — friendlier than raw
+        dB, where 100% = 0 dB reads as 'zero' to non-audio folks. Works for both
+        the continuous MK1 dB range and the MK2 detent index."""
+        adj = self.hp_scale.get_adjustment()
+        lo, hi = adj.get_lower(), adj.get_upper()
+        if hi <= lo:
+            return "0%"
+        return f"{round((value - lo) / (hi - lo) * 100)}%"
 
     def _live(self):
         """True when a user control change should be forwarded to the device."""
@@ -360,64 +385,165 @@ class WaveXLRWindow(Adw.ApplicationWindow):
 
     def _on_hp_changed(self, scale):
         if self._live():
-            self.hp_label.set_label(self.controller.set_hp(scale.get_value()))
+            self.controller.set_hp(scale.get_value())   # still drives the device in dB
+            self.hp_label.set_label(self._hp_percent(scale.get_value()))
 
     def _on_lowz_changed(self, row, _pspec):
         if self._live():
             self.controller.set_low_impedance(row.get_active())
 
-    def _wire_source_master(self, cell, source_id):
-        """Bind a source row's master fader/mute to the mixer's per-source master
-        (GoXLR channel fader: scales all that source's sends). For the mic this
-        is a software level — hardware gain lives only in the sidebar."""
-        cell.connect("volume-changed", self._on_source_master_volume_changed, source_id)
-        cell.connect("mute-toggled", self._on_source_master_mute_toggled, source_id)
+    def _wire_strip(self, strip, source_id, removable=False):
+        """Wire a channel strip to the mixer: the master trim/mute (GoXLR channel
+        fader — scales all sends), each mix's cell fader/mute, and, for a user
+        channel, the group member edits. Strip setters are signal-blocked, so
+        restoring persisted state never echoes back here."""
+        strip.connect("master-volume-changed", self._on_master_volume_changed, source_id)
+        strip.connect("master-mute-toggled", self._on_master_mute_toggled, source_id)
+        strip.connect("cell-volume-changed", self._on_cell_volume_changed, source_id)
+        strip.connect("cell-mute-toggled", self._on_cell_mute_toggled, source_id)
+        if removable:
+            strip.connect("add-member-clicked", self._on_add_member_clicked, source_id)
+            strip.connect("remove-member-clicked", self._on_remove_member_clicked, source_id)
+            strip.connect("rename-requested", self._on_rename_requested, source_id)
+            strip.connect("ungroup-clicked", self._on_ungroup_clicked, source_id)
 
-    def _on_source_master_volume_changed(self, _source, value, source_id):
-        if self._updating_ui:
-            return
+    def _on_master_volume_changed(self, _strip, value, source_id):
         self._throttle(
             ("master", source_id), value,
             lambda v, sid=source_id: self.mixer.set_master(
                 sid, v, self.mixer.get_master(sid)["muted"]),
         )
 
-    def _on_source_master_mute_toggled(self, _source, muted, source_id):
-        if self._updating_ui:
-            return
+    def _on_master_mute_toggled(self, _strip, muted, source_id):
         self.mixer.set_master(source_id, self.mixer.get_master(source_id)["volume"], muted)
 
-    def _wire_matrix_cells(self):
-        """Bind each per-cell slider/mute to the mixer + restore persisted levels."""
+    def _on_cell_volume_changed(self, _strip, mix_id, value, source_id):
+        # Live throttle (same as the device sliders): leading + ~80ms while
+        # dragging + trailing, so the mix updates in real time.
+        self._throttle(
+            ("cell", source_id, mix_id), value,
+            lambda v, s=source_id, m=mix_id: self.mixer.set_cell(
+                s, m, v, self.mixer.get_cell(s, m)["muted"]),
+        )
+
+    def _on_cell_mute_toggled(self, _strip, mix_id, muted, source_id):
+        cur = self.mixer.get_cell(source_id, mix_id)
+        self.mixer.set_cell(source_id, mix_id, cur["volume"], muted)
+
+    # ----- group membership -----
+    def _on_add_member_clicked(self, _strip, source_id):
+        dialog = PickAppsDialog(exclude_apps=self._sources.bound_apps())
+        dialog.connect("apps-picked", self._on_member_apps_picked, source_id)
+        dialog.present(self)
+
+    def _on_member_apps_picked(self, _dialog, apps, source_id):
+        for app in apps:
+            self._sources.add_member(source_id, app)
+        self._sources.save()
+        self._refresh_strip_members(source_id)
+        self.mixer.set_sources(self._sources)
+        self.mixer.poll_streams()
+        self._refresh_app_meter(source_id)
+
+    def _on_remove_member_clicked(self, _strip, app, source_id):
+        if self._sources.get(source_id) is None:
+            return
+        self._sources.remove_member(source_id, app)
+        remaining = self._sources.get(source_id)
+        if remaining is None or not remaining.members:
+            self._remove_source(source_id)   # last app gone — drop the channel
+            return
+        self._sources.save()
+        self._refresh_strip_members(source_id)
+        self.mixer.set_sources(self._sources)
+        self.mixer.poll_streams()
+        self._refresh_app_meter(source_id)
+
+    def _on_rename_requested(self, _strip, name, source_id):
+        name = name.strip()
+        if not name:
+            return
+        self._sources.rename(source_id, name)
+        self._sources.save()
+        strip = self.matrix.source(source_id)
+        if strip is not None:
+            strip.set_name(name)
+
+    def _on_ungroup_clicked(self, _strip, source_id):
+        group = self._sources.get(source_id)
+        if group is None or not group.is_group:
+            return
+        # Copy the group's master + cells onto each new single-app channel so
+        # audio doesn't jump, then swap the group strip for the new ones.
+        master = self.mixer.get_master(source_id)
+        cells = {m: self.mixer.get_cell(source_id, m)
+                 for m in ("personal", "chat", "record")}
+        new_sources = self._sources.ungroup(source_id)
+        self._sources.save()
+        self.meter.stop(source_id)
+        self._meter_targets.pop(source_id, None)
+        self.matrix.remove_source(source_id)
+        self.mixer.remove_source(source_id)
+        for ns in new_sources:
+            self.mixer.set_master(ns.id, master["volume"], master["muted"])
+            for mix_id, c in cells.items():
+                self.mixer.set_cell(ns.id, mix_id, c["volume"], c["muted"])
+            strip = self.matrix.add_source(
+                ns.id, name=ns.name, icon_name=ns.icon_name,
+                has_level=True, removable=True,
+                members=ns.members, is_group=ns.is_group,
+            )
+            self._wire_strip(strip, ns.id, removable=True)
+            self._restore_strip(ns.id)
+        self.mixer.set_sources(self._sources)
+        self.mixer.poll_streams()
+        for ns in new_sources:
+            self._refresh_app_meter(ns.id)
+
+    def _refresh_strip_members(self, source_id):
+        source = self._sources.get(source_id)
+        strip = self.matrix.source(source_id)
+        if source is not None and strip is not None:
+            strip.set_members(source.members, source.is_group)
+
+    def _remove_source(self, source_id):
+        """Tear a user channel down everywhere: meter, strip, persisted sources,
+        and the mixer's sinks/loopbacks (its apps re-home to System)."""
+        self.meter.stop(source_id)
+        self._meter_targets.pop(source_id, None)
+        self.matrix.remove_source(source_id)
+        self._sources.discard(source_id)
+        self._sources.save()
+        self.mixer.remove_source(source_id)
+
+    def _on_sources_reordered(self, _matrix):
+        """Persist a drag-reorder. Order is purely cosmetic (routing is per-id, not
+        positional), so this just re-saves the new order — no mixer change."""
+        order = [sid for sid in self.matrix.source_order()
+                 if self._sources.get(sid) is not None]
+        self._sources.reorder(order)
+        self._sources.save()
+
+    def _restore_strips(self):
+        """Push persisted master + cell levels onto every strip. Strip setters
+        are signal-blocked, so this doesn't echo back to the mixer. Masters
+        default to 1.0, so this must run or a fader would sit at 0 while the
+        mixer treats it as full."""
         # First-run: make the System catch-all audible in Personal by default.
         if f"{SYSTEM_SOURCE}.personal" not in self.mixer.cells():
             self.mixer.set_cell(SYSTEM_SOURCE, "personal", 1.0, False)
-        source_ids = ["mic", SYSTEM_SOURCE] + list(self._sources.ids())
-        for source_id in source_ids:
-            self._restore_source_master(source_id)
-            for mix_id in ("personal", "chat", "record"):
-                self._wire_cell(source_id, mix_id)
+        for source_id in ["mic", SYSTEM_SOURCE] + list(self._sources.ids()):
+            self._restore_strip(source_id)
 
-    def _restore_source_master(self, source_id):
-        """Set a source row's master fader/mute to the persisted level. Masters
-        default to 1.0, so this must run or the slider would sit at 0 while the
-        mixer treats it as full."""
-        cell = self.matrix.source(source_id)
-        if cell is None:
+    def _restore_strip(self, source_id):
+        strip = self.matrix.source(source_id)
+        if strip is None:
             return
         master = self.mixer.get_master(source_id)
-        cell.set_volume(master["volume"])
-        cell.set_muted(master["muted"])
-
-    def _wire_cell(self, source_id, mix_id):
-        cell = self.matrix.cell(source_id, mix_id)
-        if cell is None:
-            return
-        state = self.mixer.get_cell(source_id, mix_id)
-        cell.set_volume(state["volume"])
-        cell.set_muted(state["muted"])
-        cell.connect("volume-changed", self._on_cell_volume_changed, source_id, mix_id)
-        cell.connect("mute-toggled", self._on_cell_mute_toggled, source_id, mix_id)
+        strip.set_master(master["volume"], master["muted"])
+        for mix_id in ("personal", "chat", "record"):
+            c = self.mixer.get_cell(source_id, mix_id)
+            strip.set_cell(mix_id, c["volume"], c["muted"])
 
     def _start_stream_poll(self):
         """Poll for new/vanished PipeWire output streams every 2 s."""
@@ -480,27 +606,27 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         dialog.connect("source-confirmed", self._on_source_confirmed)
         dialog.present(self)
 
-    def _on_source_confirmed(self, _dialog, name, match_app_name, icon_name):
-        if match_app_name in self._sources.bound_apps():
-            return  # already bound — the picker hides these, but guard anyway
-        source = Source.new(name=name, match_app_name=match_app_name, icon_name=icon_name)
+    def _on_source_confirmed(self, _dialog, name, members, icon_name):
+        members = [m for m in members if m not in self._sources.bound_apps()]
+        if not members:
+            return  # all already bound — the picker hides these, but guard anyway
+        source = Source.new(name=name, members=members, icon_name=icon_name)
         self._sources.add(source)
         self._sources.save()
-        cell = self.matrix.add_source(
+        strip = self.matrix.add_source(
             source.id,
             name=source.name,
             icon_name=source.icon_name,
             has_level=True,
             removable=True,
+            members=source.members,
+            is_group=source.is_group,
         )
-        self._wire_source_master(cell, source.id)
-        self._restore_source_master(source.id)
-        # New sources are now *moved* onto a private sink, so they're silent
-        # until routed — default them audible in the Personal mix.
+        self._wire_strip(strip, source.id, removable=True)
+        # New channels are *moved* onto a private sink, so they're silent until
+        # routed — default them audible in the Personal mix.
         self.mixer.set_cell(source.id, "personal", 1.0, False)
-        self._wire_cell(source.id, "personal")
-        self._wire_cell(source.id, "chat")
-        self._wire_cell(source.id, "record")
+        self._restore_strip(source.id)
         self.mixer.set_sources(self._sources)
         self.mixer.poll_streams()
         self._refresh_app_meter(source.id)
@@ -522,25 +648,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
     def _on_remove_response(self, dialog, result, source_id):
         if dialog.choose_finish(result) != "remove":
             return
-        self.meter.stop(source_id)
-        self._meter_targets.pop(source_id, None)
-        self.matrix.remove_source(source_id)
-        self._sources.discard(source_id)
-        self._sources.save()
-        self.mixer.remove_source(source_id)
-
-    def _on_cell_volume_changed(self, _cell, value, source_id, mix_id):
-        # Live throttle (same as the device sliders): leading + ~80ms while
-        # dragging + trailing, so the mix updates in real time.
-        self._throttle(
-            ("cell", source_id, mix_id), value,
-            lambda v, s=source_id, m=mix_id: self.mixer.set_cell(
-                s, m, v, self.mixer.get_cell(s, m)["muted"]),
-        )
-
-    def _on_cell_mute_toggled(self, _cell, muted, source_id, mix_id):
-        cur = self.mixer.get_cell(source_id, mix_id)
-        self.mixer.set_cell(source_id, mix_id, cur["volume"], muted)
+        self._remove_source(source_id)
 
     # Live-update throttle for the matrix sliders: send on the leading edge,
     # then at most every _THROTTLE_MS while the value keeps changing, plus a

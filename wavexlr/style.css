@@ -1,37 +1,191 @@
-.openwave-mix-slider trough {
-    min-height: 8px;
-    background-color: alpha(@card_fg_color, 0.12);
-    border-radius: 4px;
+/* OpenWave mixer — vertical channel strips, segmented mix tabs, per-mix accent.
+   Faders/meters follow the system accent (@accent_bg_color); only the per-strip
+   accent bar and the active tab take the selected mix's hue (Personal = system
+   accent, Chat = green, Record = amber). */
+
+@define-color openwave_chat #2ec27e;
+@define-color openwave_chat_fg #06281a;
+@define-color openwave_record #e5a50a;
+@define-color openwave_record_fg #3d2c00;
+
+/* --- segmented mix switcher --- */
+.openwave-mix-tabs {
+    background: alpha(@card_fg_color, 0.07);
+    border-radius: 11px;
+    padding: 4px;
+}
+.openwave-mix-tabs > button {
+    padding: 7px 18px;
+    border-radius: 8px;
+    background: transparent;
+    box-shadow: none;
+    border: none;
+    outline: none;
+}
+.openwave-mix-tabs > button:hover {
+    background: alpha(@card_fg_color, 0.07);
+}
+.openwave-mix-tabs > button:checked {
+    background: @accent_bg_color;
+    color: @accent_fg_color;
+}
+.openwave-mix-tabs > button.openwave-tab-chat:checked {
+    background: @openwave_chat;
+    color: @openwave_chat_fg;
+}
+.openwave-mix-tabs > button.openwave-tab-record:checked {
+    background: @openwave_record;
+    color: @openwave_record_fg;
 }
 
-.openwave-mix-slider highlight {
-    background-color: #4ade80;
-    border-radius: 4px;
+/* --- channel strip --- */
+.openwave-strip {
+    border-radius: 14px;
+}
+/* drag-reorder: highlight the strip a dragged channel would drop onto */
+.openwave-strip.openwave-drop-into {
+    box-shadow: inset 0 0 0 2px @accent_bg_color;
 }
 
-.openwave-mix-slider:disabled highlight {
-    background-color: alpha(#4ade80, 0.35);
+/* Accent bar across the top — recoloured by the active-mix class on the row. */
+.openwave-accentbar {
+    min-height: 4px;
+    background: @accent_bg_color;
+}
+.openwave-mix-chat .openwave-accentbar {
+    background: @openwave_chat;
+}
+.openwave-mix-record .openwave-accentbar {
+    background: @openwave_record;
 }
 
-.openwave-mix-slider slider {
-    min-width: 14px;
+/* Drag-handle grip atop user channels — dim by default, brighter on hover so
+   it reads as "grab to reorder". */
+.openwave-grip {
+    color: alpha(@card_fg_color, 0.28);
     min-height: 14px;
-    background-color: #3b82f6;
-    border: 2px solid alpha(black, 0.35);
+}
+.openwave-grip:hover {
+    color: alpha(@card_fg_color, 0.65);
+}
+
+/* Icon chip in the strip header. Groups get the accent tint; singles + the
+   mic/System specials get a plain chip (the count badge is the group tell). */
+.openwave-strip-icon {
+    padding: 5px;
+    border-radius: 9px;
+    background: alpha(@accent_bg_color, 0.18);
+}
+.openwave-strip-icon.openwave-strip-icon-plain {
+    background: alpha(@card_fg_color, 0.10);
+}
+
+/* Group count badge, pinned to the chip's corner. */
+.openwave-count-badge {
+    min-width: 17px;
+    min-height: 17px;
+    padding: 0 3px;
+    margin-right: -6px;
+    margin-bottom: -6px;
+    border-radius: 9px;
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
+    font-size: 10px;
+    font-weight: 800;
+    border: 2px solid @card_bg_color;
+}
+
+/* The tall send fader (into the selected mix). */
+.openwave-send-slider trough {
+    min-width: 10px;
+    background-color: alpha(@card_fg_color, 0.14);
+    border-radius: 6px;
+}
+.openwave-send-slider highlight {
+    background-color: @accent_bg_color;
+    border-radius: 6px;
+}
+.openwave-send-slider slider {
+    min-width: 22px;
+    min-height: 22px;
+    background-color: @accent_bg_color;
+    border: 2px solid alpha(black, 0.40);
+    border-radius: 50%;
+    box-shadow: 0 2px 4px alpha(black, 0.5);
+}
+
+/* The master trim — scales all the channel's sends. */
+.openwave-master-slider trough {
+    min-height: 7px;
+    background-color: alpha(@card_fg_color, 0.14);
+    border-radius: 4px;
+}
+.openwave-master-slider highlight {
+    background-color: @accent_bg_color;
+    border-radius: 4px;
+}
+.openwave-master-slider slider {
+    min-width: 15px;
+    min-height: 15px;
+    background-color: @accent_bg_color;
+    border: 2px solid alpha(black, 0.40);
     border-radius: 50%;
     box-shadow: 0 1px 2px alpha(black, 0.4);
 }
 
-.openwave-mix-slider:disabled slider {
-    background-color: alpha(#3b82f6, 0.5);
+/* Activity meter beside the fader. */
+.openwave-level trough {
+    min-width: 10px;
+    background-color: alpha(@card_fg_color, 0.10);
+    border-radius: 6px;
+}
+.openwave-level block.filled {
+    background-color: #33d17a;
+    border-radius: 6px;
+}
+.openwave-level.dim-label block.filled {
+    background-color: alpha(@card_fg_color, 0.20);
 }
 
-.openwave-mix-header,
-.openwave-source-cell,
-.openwave-mix-cell {
-    border-radius: 10px;
+/* Per-mix mute (under the fader) + master mute (circular) go red when muted. */
+.openwave-mute {
+    padding: 4px 16px;
+    border-radius: 9px;
+}
+.openwave-mute:checked,
+.openwave-mute.error {
+    background-color: @destructive_bg_color;
+    color: @destructive_fg_color;
+}
+button.circular.error {
+    background-color: alpha(@destructive_bg_color, 0.30);
+    color: @destructive_fg_color;
 }
 
-.openwave-mix-cell:disabled {
-    opacity: 0.55;
+/* "+ Add source" strip at the end of the row. */
+.openwave-add-strip {
+    min-width: 120px;
+    border: 1.5px dashed alpha(@card_fg_color, 0.25);
+    border-radius: 14px;
+    background: transparent;
+    color: alpha(@card_fg_color, 0.7);
+}
+.openwave-add-strip:hover {
+    background-color: alpha(@card_fg_color, 0.05);
+}
+
+/* Audio Service row — highlighted (amber) when the background service is down. */
+.openwave-service-down {
+    background-color: alpha(@warning_bg_color, 0.16);
+    box-shadow: inset 3px 0 0 @warning_color;
+}
+
+/* Icon picker in the Add dialog. */
+.openwave-icon-picker flowboxchild {
+    padding: 6px;
+    border-radius: 8px;
+}
+.openwave-icon-picker flowboxchild:selected {
+    background-color: @accent_bg_color;
+    color: @accent_fg_color;
 }
