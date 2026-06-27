@@ -1,4 +1,6 @@
-"""'Add Source' picker — two pages: app picker, then name + icon config."""
+"""'Add Source' picker. Pick one app for a single channel, or several to make a
+group; then name + icon. A lighter PickAppsDialog adds apps to an existing group.
+"""
 
 import gi
 
@@ -24,16 +26,53 @@ ICON_CHOICES = (
 )
 
 
+def _available_apps(exclude_apps):
+    """{app_name: sample subtitle} for apps currently playing audio that aren't
+    already claimed by a source."""
+    exclude = set(exclude_apps)
+    apps = {}
+    for s in output_streams():
+        app = s.get("app_name")
+        if not app or app in exclude or app in apps:
+            continue
+        apps[app] = s.get("media_name") or s.get("node_name", "")
+    return apps
+
+
+def _app_check_list(apps, on_change):
+    """A boxed list of check-button rows, one per app. Calls on_change(set) with
+    the currently-checked app names whenever a row toggles."""
+    listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+    listbox.add_css_class("boxed-list")
+    checked = set()
+
+    def toggled(btn, app):
+        checked.add(app) if btn.get_active() else checked.discard(app)
+        on_change(set(checked))
+
+    for app in sorted(apps):
+        row = Adw.ActionRow(title=app)
+        if apps[app]:
+            row.set_subtitle(apps[app])
+        check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+        check.connect("toggled", toggled, app)
+        row.add_prefix(check)
+        row.set_activatable_widget(check)
+        listbox.append(row)
+    return listbox
+
+
 class AddSourceDialog(Adw.Dialog):
     __gsignals__ = {
-        # (display_name, match_app_name, icon_name)
-        "source-confirmed": (GObject.SignalFlags.RUN_FIRST, None, (str, str, str)),
+        # (display_name, members: list[str], icon_name)
+        "source-confirmed": (
+            GObject.SignalFlags.RUN_FIRST, None, (str, GObject.TYPE_PYOBJECT, str)),
     }
 
     def __init__(self, exclude_apps=()):
         super().__init__()
-        # Apps already bound to a source — hidden from the picker so an app
-        # can't be claimed twice (the second would steal the first's streams).
+        # Apps already bound to a source — hidden so an app can't be claimed
+        # twice (the second binding would steal the first's streams).
         self._exclude_apps = set(exclude_apps)
         self.set_title("Add Source")
         self.set_content_width(480)
@@ -42,15 +81,14 @@ class AddSourceDialog(Adw.Dialog):
         self._nav = Adw.NavigationView()
         self.set_child(self._nav)
 
-        self._selected_app = None
+        self._checked = set()
         self._selected_icon = ICON_CHOICES[0][0]
 
         self._nav.push(self._build_picker_page())
 
     # ------------------------------------------------------------ page 1
     def _build_picker_page(self):
-        page = Adw.NavigationPage(title="Pick Application")
-
+        page = Adw.NavigationPage(title="Pick Applications")
         view = Adw.ToolbarView()
         page.set_child(view)
 
@@ -80,71 +118,47 @@ class AddSourceDialog(Adw.Dialog):
         clamp.set_child(outer)
 
         hint = Gtk.Label(
-            label="Pick an application that's currently playing audio. "
-                  "OpenWave will route any future streams from this app through the new source row.",
+            label="Pick an app that's currently playing audio — or check several "
+                  "to group them under one set of mix levels. OpenWave routes any "
+                  "future streams from these apps through the new channel.",
             wrap=True, xalign=0,
         )
         hint.add_css_class("dim-label")
         outer.append(hint)
 
-        self._listbox = Gtk.ListBox()
-        self._listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
-        self._listbox.add_css_class("boxed-list")
-        self._listbox.connect("row-selected", self._on_row_selected)
-        outer.append(self._listbox)
-
-        self._populate_apps()
-        return page
-
-    def _populate_apps(self):
-        streams = output_streams()
-        apps = {}
-        for s in streams:
-            if s["app_name"] in self._exclude_apps:
-                continue  # already a source
-            apps.setdefault(s["app_name"], []).append(s)
-
+        apps = _available_apps(self._exclude_apps)
         if not apps:
             empty = Adw.ActionRow(title="No new apps playing audio")
             empty.set_subtitle("Every app currently playing is already a source, "
                                "or nothing is playing. Start an app, then try again.")
             empty.set_sensitive(False)
-            self._listbox.append(empty)
-            return
+            box = Gtk.ListBox()
+            box.add_css_class("boxed-list")
+            box.append(empty)
+            outer.append(box)
+        else:
+            outer.append(_app_check_list(apps, self._on_checked_changed))
+        return page
 
-        for app_name in sorted(apps.keys()):
-            row = Adw.ActionRow(title=app_name)
-            sample = apps[app_name][0].get("media_name") or apps[app_name][0].get("node_name", "")
-            if sample:
-                row.set_subtitle(sample)
-            row.add_prefix(Gtk.Image.new_from_icon_name("applications-multimedia-symbolic"))
-            row._app_name = app_name  # noqa: SLF001
-            self._listbox.append(row)
-
-    def _on_row_selected(self, _box, row):
-        if row is None:
-            self._selected_app = None
-            self._next_btn.set_sensitive(False)
-            return
-        self._selected_app = getattr(row, "_app_name", None)
-        self._next_btn.set_sensitive(self._selected_app is not None)
+    def _on_checked_changed(self, checked):
+        self._checked = checked
+        self._next_btn.set_sensitive(bool(checked))
 
     def _on_next(self, _btn):
-        if not self._selected_app:
-            return
-        self._nav.push(self._build_config_page())
+        if self._checked:
+            self._nav.push(self._build_config_page())
 
     # ------------------------------------------------------------ page 2
     def _build_config_page(self):
         page = Adw.NavigationPage(title="Name and Icon")
-
         view = Adw.ToolbarView()
         page.set_child(view)
 
         header = Adw.HeaderBar()
         view.add_top_bar(header)
 
-        add_btn = Gtk.Button(label="Add Source")
+        is_group = len(self._checked) > 1
+        add_btn = Gtk.Button(label="Create Group" if is_group else "Add Source")
         add_btn.add_css_class("suggested-action")
         add_btn.connect("clicked", self._on_confirm)
         header.pack_end(add_btn)
@@ -161,34 +175,34 @@ class AddSourceDialog(Adw.Dialog):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         clamp.set_child(outer)
 
-        # Name group
-        name_group = Adw.PreferencesGroup(title="Name")
+        name_group = Adw.PreferencesGroup(
+            title="Name",
+            description=("Grouping " + ", ".join(sorted(self._checked))) if is_group else None,
+        )
         outer.append(name_group)
 
-        self._name_row = Adw.EntryRow(title="Source name")
-        self._name_row.set_text(self._selected_app or "")
+        self._name_row = Adw.EntryRow(title="Channel name")
+        default = "" if is_group else next(iter(self._checked))
+        self._name_row.set_text(default)
         name_group.add(self._name_row)
 
-        # Icon picker
         icon_group = Adw.PreferencesGroup(title="Icon")
         outer.append(icon_group)
 
         flow = Gtk.FlowBox(
             selection_mode=Gtk.SelectionMode.SINGLE,
-            max_children_per_line=6,
-            min_children_per_line=4,
-            column_spacing=6,
-            row_spacing=6,
+            max_children_per_line=6, min_children_per_line=4,
+            column_spacing=6, row_spacing=6,
             margin_start=4, margin_end=4, margin_top=8, margin_bottom=8,
             homogeneous=True,
         )
         flow.add_css_class("openwave-icon-picker")
         first_child = None
         for icon_name, tooltip in ICON_CHOICES:
-            btn = Gtk.Image.new_from_icon_name(icon_name)
-            btn.set_pixel_size(28)
+            img = Gtk.Image.new_from_icon_name(icon_name)
+            img.set_pixel_size(28)
             child = Gtk.FlowBoxChild()
-            child.set_child(btn)
+            child.set_child(img)
             child.set_tooltip_text(tooltip)
             child._icon_name = icon_name  # noqa: SLF001
             flow.append(child)
@@ -200,7 +214,6 @@ class AddSourceDialog(Adw.Dialog):
         if first_child is not None:
             flow.select_child(first_child)
             self._selected_icon = first_child._icon_name  # noqa: SLF001
-
         return page
 
     def _on_icon_selected(self, flow):
@@ -209,8 +222,68 @@ class AddSourceDialog(Adw.Dialog):
             self._selected_icon = getattr(sel[0], "_icon_name", self._selected_icon)
 
     def _on_confirm(self, _btn):
-        if not self._selected_app:
+        if not self._checked:
             return
-        name = self._name_row.get_text().strip() or self._selected_app
-        self.emit("source-confirmed", name, self._selected_app, self._selected_icon)
+        members = sorted(self._checked)
+        name = self._name_row.get_text().strip() or (
+            "Group" if len(members) > 1 else members[0])
+        self.emit("source-confirmed", name, members, self._selected_icon)
+        self.close()
+
+
+class PickAppsDialog(Adw.Dialog):
+    """Minimal multi-select app picker used to add apps to an existing group."""
+
+    __gsignals__ = {
+        "apps-picked": (GObject.SignalFlags.RUN_FIRST, None, (GObject.TYPE_PYOBJECT,)),
+    }
+
+    def __init__(self, exclude_apps=()):
+        super().__init__()
+        self.set_title("Add Apps")
+        self.set_content_width(440)
+        self.set_content_height(480)
+        self._checked = set()
+
+        view = Adw.ToolbarView()
+        self.set_child(view)
+        header = Adw.HeaderBar()
+        view.add_top_bar(header)
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda _: self.close())
+        header.pack_start(cancel)
+        self._add = Gtk.Button(label="Add")
+        self._add.add_css_class("suggested-action")
+        self._add.set_sensitive(False)
+        self._add.connect("clicked", self._on_add)
+        header.pack_end(self._add)
+
+        scroll = Gtk.ScrolledWindow(vexpand=True)
+        view.set_content(scroll)
+        clamp = Adw.Clamp(
+            maximum_size=400,
+            margin_start=12, margin_end=12, margin_top=12, margin_bottom=12,
+        )
+        scroll.set_child(clamp)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        clamp.set_child(outer)
+
+        apps = _available_apps(exclude_apps)
+        if not apps:
+            row = Adw.ActionRow(title="No other apps playing audio")
+            row.set_sensitive(False)
+            box = Gtk.ListBox()
+            box.add_css_class("boxed-list")
+            box.append(row)
+            outer.append(box)
+        else:
+            outer.append(_app_check_list(apps, self._on_checked_changed))
+
+    def _on_checked_changed(self, checked):
+        self._checked = checked
+        self._add.set_sensitive(bool(checked))
+
+    def _on_add(self, _btn):
+        if self._checked:
+            self.emit("apps-picked", sorted(self._checked))
         self.close()

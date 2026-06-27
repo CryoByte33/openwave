@@ -1,15 +1,19 @@
-"""User-defined matrix sources — a typed Source plus the SourceSet that owns
+"""User-defined matrix channels — a typed Source plus the SourceSet that owns
 the collection, the stream→source match, and persistence to
 ~/.config/openwave/sources.json.
 
-A source binds to a PipeWire application.name; any current or future stream from
-that application is matched to the source and routed through its row.
+A source is one matrix channel. It matches one or more PipeWire
+application.name values — its *members*; any current or future stream from a
+member app is matched to the source and routed through its row. A source with
+two or more members is a **group**: every member follows the one set of mix
+levels (there are no per-member levels). One app belongs to at most one source —
+a second binding would steal the first's streams, since matching is by name.
 """
 
 import json
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 CONFIG_PATH = os.path.expanduser("~/.config/openwave/sources.json")
 DEFAULT_ICON = "applications-multimedia-symbolic"
@@ -19,31 +23,40 @@ DEFAULT_ICON = "applications-multimedia-symbolic"
 class Source:
     id: str
     name: str
-    match_app_name: str
+    members: tuple          # app names this channel matches (1..N); >=2 is a group
     icon_name: str = DEFAULT_ICON
 
     @classmethod
-    def new(cls, *, name, match_app_name, icon_name=DEFAULT_ICON):
-        return cls(uuid.uuid4().hex[:12], name, match_app_name, icon_name)
+    def new(cls, *, name, members, icon_name=DEFAULT_ICON):
+        return cls(uuid.uuid4().hex[:12], name, tuple(members), icon_name)
 
     @classmethod
     def from_dict(cls, d):
-        """Build from a persisted dict, tolerating missing optional fields. The
-        id is required — a source without one is meaningless and is rejected."""
+        """Build from a persisted dict, tolerating missing optional fields and
+        the pre-grouping schema (a single `match_app_name`). The id is required —
+        a source without one is meaningless and is rejected."""
+        members = d.get("members")
+        if members is None:                      # migrate the old single-app form
+            one = d.get("match_app_name", "")
+            members = [one] if one else []
         return cls(
             id=d["id"],
             name=d.get("name", d["id"]),
-            match_app_name=d.get("match_app_name", ""),
+            members=tuple(members),
             icon_name=d.get("icon_name", DEFAULT_ICON),
         )
 
     def to_dict(self):
         return {"id": self.id, "name": self.name,
-                "match_app_name": self.match_app_name, "icon_name": self.icon_name}
+                "members": list(self.members), "icon_name": self.icon_name}
+
+    @property
+    def is_group(self):
+        return len(self.members) >= 2
 
 
 class SourceSet:
-    """The user's app sources: identity, the stream→source match, persistence.
+    """The user's app channels: identity, the stream→source match, persistence.
 
     The match rule lives here once; the mixer, the window, and the add-source
     dialog ask it instead of re-deriving 'does this stream belong to this
@@ -70,9 +83,9 @@ class SourceSet:
         return self._by_id.get(source_id)
 
     def bound_apps(self):
-        """Application names already claimed by a source. One source per app —
-        a second binding would steal the first's streams (matching is by name)."""
-        return {s.match_app_name for s in self._by_id.values()}
+        """Application names already claimed by some source's membership. One app
+        per source — a second binding would steal the first's streams."""
+        return {app for s in self._by_id.values() for app in s.members}
 
     def add(self, source):
         self._by_id[source.id] = source
@@ -80,24 +93,68 @@ class SourceSet:
     def discard(self, source_id):
         self._by_id.pop(source_id, None)
 
+    # ----- membership edits (frozen Source, so each returns a replaced copy) -----
+    def add_member(self, source_id, app_name):
+        s = self._by_id.get(source_id)
+        if s is None or app_name in s.members:
+            return
+        self._by_id[source_id] = replace(s, members=s.members + (app_name,))
+
+    def remove_member(self, source_id, app_name):
+        """Drop an app from a source. The caller decides what to do if this
+        empties the source (the window removes the now-memberless channel)."""
+        s = self._by_id.get(source_id)
+        if s is None or app_name not in s.members:
+            return
+        self._by_id[source_id] = replace(
+            s, members=tuple(m for m in s.members if m != app_name))
+
+    def rename(self, source_id, name):
+        s = self._by_id.get(source_id)
+        if s is not None:
+            self._by_id[source_id] = replace(s, name=name)
+
+    def reorder(self, ordered_ids):
+        """Reorder the channels to match ordered_ids; any id not listed keeps its
+        relative order at the end. Persisted order is just dict insertion order,
+        so saving after this makes the new order stick across restarts."""
+        new = {sid: self._by_id[sid] for sid in ordered_ids if sid in self._by_id}
+        for sid, s in self._by_id.items():
+            new.setdefault(sid, s)
+        self._by_id = new
+
+    def ungroup(self, source_id):
+        """Split a group into one single-app channel per member. Removes the
+        group and returns the new Sources, so the caller can copy the group's
+        mix levels onto them (audio shouldn't jump). No-op for a non-group."""
+        s = self._by_id.get(source_id)
+        if s is None or not s.is_group:
+            return []
+        self.discard(source_id)
+        new = [Source.new(name=app, members=[app], icon_name=s.icon_name)
+               for app in s.members]
+        for ns in new:
+            self.add(ns)
+        return new
+
     # ----- matching -----
     def source_for(self, stream):
-        """id of the source bound to this stream's application, or None. On a
-        tie (two sources on the same app) the last-added wins — preserving the
-        previous dict-overwrite behaviour."""
+        """id of the source whose membership claims this stream's application, or
+        None. On a tie (an app claimed by two sources, which the UI prevents) the
+        last-added wins — preserving the previous dict-overwrite behaviour."""
         app = stream.get("app_name")
         match = None
         for s in self._by_id.values():
-            if s.match_app_name == app:
+            if app in s.members:
                 match = s.id
         return match
 
     def streams_for(self, source_id, streams):
-        """The streams (from an iterable) belonging to source_id."""
+        """The streams (from an iterable) belonging to source_id's members."""
         s = self._by_id.get(source_id)
         if s is None:
             return []
-        return [st for st in streams if st.get("app_name") == s.match_app_name]
+        return [st for st in streams if st.get("app_name") in s.members]
 
     # ----- persistence -----
     @classmethod
