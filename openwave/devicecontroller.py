@@ -22,6 +22,8 @@ class DeviceCaps:
     hp_detents: tuple = None          # None = continuous dB slider
     supports_low_impedance: bool = True
     supports_volume_select: bool = True
+    supports_crossfade: bool = False
+    supports_voice_effects: bool = False
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,11 @@ class DeviceView:
     hp_label: str = "—"
     low_impedance: bool = False
     knob_label: str = "Gain"         # "Headphones" | "Gain"
+    crossfade: int = 100             # 0..200, self-monitoring mic/PC blend
+    lowcut: bool = False
+    expander: bool = False
+    voice_tune: bool = False
+    voice_tune_strength: int = 50    # 0..100, Weak..Strong
     caps: DeviceCaps = DeviceCaps()
     fw_version: str = "—"
     api_version: str = "—"
@@ -107,6 +114,8 @@ class DeviceController:
             hp_detents=tuple(detents) if detents else None,
             supports_low_impedance=getattr(self.xlr, "supports_low_impedance", True),
             supports_volume_select=getattr(self.xlr, "supports_volume_select", True),
+            supports_crossfade=getattr(self.xlr, "supports_crossfade", False),
+            supports_voice_effects=getattr(self.xlr, "supports_voice_effects", False),
         )
         self._emit("OpenWave", connected=True)
         if self._on_connected is not None:
@@ -179,6 +188,30 @@ class DeviceController:
             return
         self._sched.run_async(lambda: self.xlr.set_low_impedance(enabled), on_error=self._lost)
 
+    def set_crossfade(self, value):
+        """Throttled self-monitoring crossfade write (live slider)."""
+        self._throttle("crossfade", int(value), lambda v: self.xlr.set_crossfade(v))
+
+    def set_lowcut(self, enabled):
+        if not self.xlr.connected:
+            return
+        self._sched.run_async(lambda: self.xlr.set_lowcut(enabled), on_error=self._lost)
+
+    def set_expander(self, enabled):
+        if not self.xlr.connected:
+            return
+        self._sched.run_async(lambda: self.xlr.set_expander(enabled), on_error=self._lost)
+
+    def set_voice_tune(self, enabled):
+        if not self.xlr.connected:
+            return
+        self._sched.run_async(lambda: self.xlr.set_voice_tune(enabled), on_error=self._lost)
+
+    def set_voice_tune_strength(self, value):
+        """Throttled voice-tune strength write (live slider)."""
+        self._throttle("voice_tune_strength", int(value),
+                       lambda v: self.xlr.set_voice_tune_strength(v))
+
     def set_gain(self, raw):
         """Throttled gain write. Returns the formatted label for an optimistic
         UI update while dragging."""
@@ -226,6 +259,11 @@ class DeviceController:
             hp_value=hp_value, hp_label=hp_label,
             low_impedance=s["low_impedance"],
             knob_label="Headphones" if s["volume_select"] == "hp" else "Gain",
+            crossfade=s.get("crossfade", 100),
+            lowcut=s.get("lowcut", False),
+            expander=s.get("expander", False),
+            voice_tune=s.get("voice_tune", False),
+            voice_tune_strength=s.get("voice_tune_strength", 50),
             caps=self._caps,
             fw_version=self._info.get("fw_version", "—"),
             api_version=self._info.get("api_version", "—"),

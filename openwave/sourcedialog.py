@@ -27,21 +27,29 @@ ICON_CHOICES = (
 
 
 def _available_apps(exclude_apps):
-    """{app_name: sample subtitle} for apps currently playing audio that aren't
-    already claimed by a source."""
+    """[{app, display, subtitle}] for apps currently playing audio that aren't
+    already claimed. `app` is the stable match key; `display` is the friendly
+    label (e.g. "RuneLite" for an "ALSA plug-in [java]" stream)."""
     exclude = set(exclude_apps)
-    apps = {}
+    seen = set()
+    out = []
     for s in output_streams():
         app = s.get("app_name")
-        if not app or app in exclude or app in apps:
+        if not app or app in exclude or app in seen:
             continue
-        apps[app] = s.get("media_name") or s.get("node_name", "")
-    return apps
+        seen.add(app)
+        display = s.get("display_name") or app
+        # Show the raw match key when the friendly name differs, so it's clear
+        # which stream this binds; otherwise fall back to the media/node label.
+        subtitle = app if display != app else (s.get("media_name") or s.get("node_name", ""))
+        out.append({"app": app, "display": display, "subtitle": subtitle})
+    out.sort(key=lambda a: a["display"].lower())
+    return out
 
 
 def _app_check_list(apps, on_change):
     """A boxed list of check-button rows, one per app. Calls on_change(set) with
-    the currently-checked app names whenever a row toggles."""
+    the currently-checked app *match keys* whenever a row toggles."""
     listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
     listbox.add_css_class("boxed-list")
     checked = set()
@@ -50,12 +58,12 @@ def _app_check_list(apps, on_change):
         checked.add(app) if btn.get_active() else checked.discard(app)
         on_change(set(checked))
 
-    for app in sorted(apps):
-        row = Adw.ActionRow(title=app)
-        if apps[app]:
-            row.set_subtitle(apps[app])
+    for a in apps:
+        row = Adw.ActionRow(title=a["display"])
+        if a["subtitle"]:
+            row.set_subtitle(a["subtitle"])
         check = Gtk.CheckButton(valign=Gtk.Align.CENTER)
-        check.connect("toggled", toggled, app)
+        check.connect("toggled", toggled, a["app"])
         row.add_prefix(check)
         row.set_activatable_widget(check)
         listbox.append(row)
@@ -82,6 +90,7 @@ class AddSourceDialog(Adw.Dialog):
         self.set_child(self._nav)
 
         self._checked = set()
+        self._apps = {}   # match key -> friendly display name
         self._selected_icon = ICON_CHOICES[0][0]
 
         self._nav.push(self._build_picker_page())
@@ -127,6 +136,7 @@ class AddSourceDialog(Adw.Dialog):
         outer.append(hint)
 
         apps = _available_apps(self._exclude_apps)
+        self._apps = {a["app"]: a["display"] for a in apps}
         if not apps:
             empty = Adw.ActionRow(title="No new apps playing audio")
             empty.set_subtitle("Every app currently playing is already a source, "
@@ -175,14 +185,16 @@ class AddSourceDialog(Adw.Dialog):
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         clamp.set_child(outer)
 
+        member_labels = sorted(self._apps.get(a, a) for a in self._checked)
         name_group = Adw.PreferencesGroup(
             title="Name",
-            description=("Grouping " + ", ".join(sorted(self._checked))) if is_group else None,
+            description=("Grouping " + ", ".join(member_labels)) if is_group else None,
         )
         outer.append(name_group)
 
         self._name_row = Adw.EntryRow(title="Channel name")
-        default = "" if is_group else next(iter(self._checked))
+        single = next(iter(self._checked))
+        default = "" if is_group else self._apps.get(single, single)
         self._name_row.set_text(default)
         name_group.add(self._name_row)
 
@@ -226,7 +238,7 @@ class AddSourceDialog(Adw.Dialog):
             return
         members = sorted(self._checked)
         name = self._name_row.get_text().strip() or (
-            "Group" if len(members) > 1 else members[0])
+            "Group" if len(members) > 1 else self._apps.get(members[0], members[0]))
         self.emit("source-confirmed", name, members, self._selected_icon)
         self.close()
 
