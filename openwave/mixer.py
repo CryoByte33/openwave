@@ -501,6 +501,9 @@ class Mixer:
             node_name = cell_loop(send.source_id, send.mix_id)
             if key not in self._procs:
                 self._spawn_loopback(key, send.capture, send.target, node_name)
-            if self._cell_state.get(key) != (send.volume, send.muted):
+            # Only volume/cache a loopback that actually spawned. A failed spawn
+            # would otherwise cache the level and skip re-applying it on the next
+            # (successful) retry, leaving that loopback stuck at unity.
+            if key in self._procs and self._cell_state.get(key) != (send.volume, send.muted):
                 self._set_loop_volume(key, node_name, send.volume, send.muted)
                 self._cell_state[key] = (send.volume, send.muted)

@@ -38,6 +38,7 @@ class FakePipeWire:
         self.spawns = []
         self.links = []
         self.volumes = []
+        self.fail_spawn = False
         self._nid = 100
 
     # used during Mixer.__init__ (_find_alsa) — no Wave XLR in the fake graph
@@ -52,6 +53,8 @@ class FakePipeWire:
         self.cleared.append(sid)
 
     def spawn_loopback(self, cap_props, play_props):
+        if self.fail_spawn:
+            return None
         p = FakeProc()
         self.spawns.append((cap_props, play_props, p))
         return p
@@ -120,6 +123,18 @@ def test_reconcile_moves_streams_only_on_change():
     assert fake.moves == [(1, "sink_a")]
     m._reconcile(RoutingPlan(sends=(), moves={1: "sink_b"}))   # retargeted
     assert fake.moves[-1] == (1, "sink_b")
+
+
+def test_failed_spawn_is_retried_and_then_volumed():
+    fake, m = _mixer()
+    fake.fail_spawn = True
+    m._reconcile(RoutingPlan(sends=(_send(vol=0.5),), moves={}))
+    assert ("g1", "personal") not in m._procs   # spawn failed
+    assert fake.volumes == []                    # nothing cached/applied
+    fake.fail_spawn = False                       # device settles
+    m._reconcile(RoutingPlan(sends=(_send(vol=0.5),), moves={}))
+    assert ("g1", "personal") in m._procs        # retried successfully
+    assert fake.volumes and fake.volumes[-1][1:] == (0.5, False)  # volume now applied
 
 
 def test_reconcile_forgets_vanished_move():
