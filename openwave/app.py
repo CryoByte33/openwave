@@ -463,11 +463,23 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         if self._live():
             self.controller.set_voice_tune_strength(scale.get_value())
 
+    def _app_display_names(self):
+        """{match-key app_name: friendly display name} from current streams, only
+        where they differ. Lets a group's member list show "RuneLite" for an
+        "ALSA plug-in [java]" match key."""
+        out = {}
+        for s in self.mixer.streams().values():
+            app, disp = s.get("app_name"), s.get("display_name")
+            if app and disp and disp != app:
+                out[app] = disp
+        return out
+
     def _wire_strip(self, strip, source_id, removable=False):
         """Wire a channel strip to the mixer: the master trim/mute (GoXLR channel
         fader — scales all sends), each mix's cell fader/mute, and, for a user
         channel, the group member edits. Strip setters are signal-blocked, so
         restoring persisted state never echoes back here."""
+        strip.member_name_resolver = self._app_display_names
         strip.connect("master-volume-changed", self._on_master_volume_changed, source_id)
         strip.connect("master-mute-toggled", self._on_master_mute_toggled, source_id)
         strip.connect("cell-volume-changed", self._on_cell_volume_changed, source_id)

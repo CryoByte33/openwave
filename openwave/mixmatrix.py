@@ -252,6 +252,9 @@ class ChannelStrip(Gtk.Box):
         self._members = tuple(members)
         self._is_group = is_group
         self._removable = removable
+        # Optional callable -> {match-key app_name: friendly display name}; set by
+        # the app so the member list can show "RuneLite" instead of the raw key.
+        self.member_name_resolver = None
         self._active_mix = MIX_IDS[0]
         self._cells = {m: {"volume": 0.0, "muted": False} for m in MIX_IDS}
         self._master = {"volume": 1.0, "muted": False}
@@ -330,6 +333,8 @@ class ChannelStrip(Gtk.Box):
             self._manage_btn.add_css_class("flat")
             self._manage_btn.add_css_class("circular")
             self._member_pop = Gtk.Popover()
+            # Rebuild on open so member names reflect whatever's playing right now.
+            self._member_pop.connect("notify::visible", self._on_member_pop_visible)
             self._manage_btn.set_popover(self._member_pop)
             head.append(self._manage_btn)
         else:
@@ -350,6 +355,10 @@ class ChannelStrip(Gtk.Box):
             self._badge.set_visible(False)
         if self._member_pop is not None:
             self._member_pop.set_child(self._build_member_manager())
+
+    def _on_member_pop_visible(self, pop, _pspec):
+        if pop.get_visible():
+            pop.set_child(self._build_member_manager())
 
     def _build_member_manager(self):
         box = Gtk.Box(
@@ -383,8 +392,12 @@ class ChannelStrip(Gtk.Box):
 
         members_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         members_list.add_css_class("boxed-list")
+        names = self.member_name_resolver() if self.member_name_resolver else {}
         for app in self._members:
-            row = Adw.ActionRow(title=app)
+            display = names.get(app, app)
+            row = Adw.ActionRow(title=display)
+            if display != app:  # show the raw match key so it's clear what binds
+                row.set_subtitle(app)
             rm = Gtk.Button(
                 icon_name="list-remove-symbolic", valign=Gtk.Align.CENTER,
                 tooltip_text="Remove from group")

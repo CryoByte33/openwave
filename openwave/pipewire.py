@@ -15,6 +15,7 @@ import subprocess
 import time
 
 from .pwnames import LOOPBACK_SWEEP, is_ours
+from .wmnames import pid_names
 
 # Linux-only: make spawned children receive SIGTERM if our process dies. Survives
 # SIGKILL on the parent, hard crashes, anything that skips Python cleanup paths.
@@ -35,10 +36,51 @@ def _set_pdeathsig():
         _libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGTERM), 0, 0, 0)
 
 
+_GENERIC_PREFIXES = ("ALSA plug-in", "alsa-playback", "PulseAudio")
+# Engine/toolkit defaults that aren't the real app — Electron apps commonly
+# report "Chromium" even though the binary is the actual app (e.g. "Cider").
+_GENERIC_NAMES = {"chromium", "electron", "unknown"}
+# Binaries that are runtimes/launchers, not the app itself — their name tells us
+# nothing, so for these we fall through to the owning X11 window instead.
+_RUNTIME_BINARIES = {
+    "java", "electron", "chromium", "chromium-browser", "chrome",
+    "google-chrome", "wine", "wine64", "wine-preloader", "python", "python3",
+    "mono", "node", "nw", "sh", "bash",
+}
+
+
+def _to_int(v):
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_generic(app_name, binary):
+    """True when application.name is an unhelpful toolkit/bridge label rather than
+    the real app — these are the ones worth enriching."""
+    if not app_name or app_name.strip().lower() in _GENERIC_NAMES:
+        return True
+    if any(app_name.startswith(p) for p in _GENERIC_PREFIXES):
+        return True
+    return bool(binary) and app_name.strip().lower() == binary.strip().lower()
+
+
+def _binary_name(binary, app_name):
+    """A friendly name from the process binary (e.g. "Cider" behind "Chromium"),
+    or None when the binary is a runtime ("java") or just echoes app_name."""
+    b = (binary or "").strip()
+    if not b or b.lower() in _RUNTIME_BINARIES or b.lower() == app_name.strip().lower():
+        return None
+    return b
+
+
 def output_streams():
-    """[{id, app_name, media_name, node_name, binary}, ...] for active app
-    output streams. Our own openwave_* nodes are excluded. Module-level so the
-    add-source dialog can enumerate apps without holding an adapter."""
+    """[{id, app_name, display_name, media_name, node_name, binary}, ...] for
+    active app output streams. Our own openwave_* nodes are excluded. `app_name`
+    is the stable match key (PipeWire application.name); `display_name` is a
+    friendlier label, resolved from the owning X11 window for generic names.
+    Module-level so the add-source dialog can enumerate apps without an adapter."""
     try:
         r = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5)
         if r.returncode != 0:
@@ -63,7 +105,24 @@ def output_streams():
             "media_name": props.get("media.name", ""),
             "node_name": node_name,
             "binary": props.get("application.process.binary", ""),
+            "_pid": _to_int(props.get("application.process.id")),
         })
+
+    # For generic names, prefer a meaningful binary ("Cider"), else the owning
+    # X11 window ("RuneLite"). X11 is looked up lazily, only if a generic stream
+    # has no usable binary, so the common path never touches it.
+    pids = None
+    for s in out:
+        pid = s.pop("_pid")
+        if not _is_generic(s["app_name"], s["binary"]):
+            s["display_name"] = s["app_name"]
+            continue
+        name = _binary_name(s["binary"], s["app_name"])
+        if not name:
+            if pids is None:
+                pids = pid_names()
+            name = pids.get(pid) if pid else None
+        s["display_name"] = name or s["app_name"]
     return out
 
 
