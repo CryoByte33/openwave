@@ -11,6 +11,7 @@ scheduler (controllable clock) and a fake backend — no main loop, no hardware.
 from dataclasses import dataclass
 
 from .device import WaveXLR, WaveXLRMk2, detect_pid, PID_MK2
+from .scheduler import Throttler
 
 _POLL_S = 0.1          # 10 Hz hardware-state poll
 _RECONNECT_S = 2.0     # hotplug poll
@@ -67,9 +68,7 @@ class DeviceController:
         self._connecting = False
         self._poll_handle = None
         self._reconnect_handle = None
-        self._thr_pending = {}
-        self._thr_send = {}
-        self._thr_handle = {}
+        self._throttler = Throttler(scheduler, _THROTTLE_S)
 
     @property
     def connected(self):
@@ -190,7 +189,8 @@ class DeviceController:
 
     def set_crossfade(self, value):
         """Throttled self-monitoring crossfade write (live slider)."""
-        self._throttle("crossfade", int(value), lambda v: self.xlr.set_crossfade(v))
+        self._throttler.push("crossfade", int(value),
+                             lambda v: self._dispatch(lambda: self.xlr.set_crossfade(v)))
 
     def set_lowcut(self, enabled):
         if not self.xlr.connected:
@@ -209,14 +209,14 @@ class DeviceController:
 
     def set_voice_tune_strength(self, value):
         """Throttled voice-tune strength write (live slider)."""
-        self._throttle("voice_tune_strength", int(value),
-                       lambda v: self.xlr.set_voice_tune_strength(v))
+        self._throttler.push("voice_tune_strength", int(value),
+                             lambda v: self._dispatch(lambda: self.xlr.set_voice_tune_strength(v)))
 
     def set_gain(self, raw):
         """Throttled gain write. Returns the formatted label for an optimistic
         UI update while dragging."""
-        self._throttle("gain", raw,
-                       lambda v: self.xlr.set_gain_raw(v))
+        self._throttler.push("gain", raw,
+                             lambda v: self._dispatch(lambda: self.xlr.set_gain_raw(v)))
         return self.xlr.format_gain(raw)
 
     def set_hp(self, slider_value):
@@ -227,15 +227,13 @@ class DeviceController:
             db = self._caps.hp_detents[idx]
         else:
             db = slider_value
-        self._throttle("hp", db, lambda v: self.xlr.set_hp_volume_db(v))
+        self._throttler.push("hp", db, lambda v: self._dispatch(lambda: self.xlr.set_hp_volume_db(v)))
         return f"{db:.1f} dB"
 
     def stop(self):
         self._stop_polling()
         self._stop_reconnect()
-        for handle in self._thr_handle.values():
-            self._sched.cancel(handle)
-        self._thr_handle.clear()
+        self._throttler.cancel_all()
         self.xlr.disconnect()
 
     # ----- view -----
@@ -270,26 +268,8 @@ class DeviceController:
             serial=self._info.get("serial", "—"),
         )
 
-    # ----- live-slider throttle (leading + periodic + trailing) -----
-    def _throttle(self, name, value, write):
-        self._thr_pending[name] = value
-        self._thr_send[name] = write
-        if self._thr_handle.get(name) is None:
-            self._thr_flush(name)
-            self._thr_handle[name] = self._sched.call_every(
-                _THROTTLE_S, lambda n=name: self._thr_tick(n))
-
-    def _thr_tick(self, name):
-        if name in self._thr_pending:
-            self._thr_flush(name)
-            return True
-        self._thr_handle[name] = None
-        return False
-
-    def _thr_flush(self, name):
-        if name not in self._thr_pending:
-            return
-        value = self._thr_pending.pop(name)
-        if not self.xlr.connected:
-            return
-        self._sched.run_async(lambda: self._thr_send[name](value), on_error=self._lost)
+    def _dispatch(self, fn):
+        """Run a throttled device write off the main thread, but only while
+        connected; a write that fails mid-drag trips reconnect via _lost."""
+        if self.xlr.connected:
+            self._sched.run_async(fn, on_error=self._lost)
