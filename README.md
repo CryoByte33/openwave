@@ -48,6 +48,26 @@ Uninstall:
 sudo make -C /path/to/openwave uninstall PREFIX=/usr/local
 ```
 
+### Upgrading from a `wavexlr` install
+
+Earlier releases shipped as the `wavexlr` Python package, with a matching `python3 -m wavexlr` entry point and a `wavexlr-audio` runit service. All of that is now named `openwave`. To move an existing install over:
+
+1. Reinstall from the updated source (`./install.sh`, or `sudo make install`). This adds the `openwave` package and rewrites the launcher.
+2. Re-run setup under the new name: in OpenWave's device pane, uninstall Capture Fix, then restart the app. It reinstalls the audio service and the USB rule pointing at `openwave`, and clears the old `99-wavexlr.rules` in the process.
+3. Delete the leftover `wavexlr` package, which the reinstall leaves sitting next to the new one in your Python site-packages:
+
+   ```bash
+   sudo rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')/wavexlr"
+   ```
+
+4. On runit only, remove the old service once `openwave-audio` is up:
+
+   ```bash
+   sudo sv down wavexlr-audio
+   sudo rm -f /var/service/wavexlr-audio
+   sudo rm -rf /etc/sv/wavexlr-audio /var/log/wavexlr-audio
+   ```
+
 ### Requirements
 
 - Python 3.10+
