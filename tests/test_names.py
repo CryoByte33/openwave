@@ -9,6 +9,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from openwave.pipewire import _binary_name, _is_generic
+from openwave.wmnames import _pick_name
 
 
 def test_name_matching_binary_is_not_generic():
@@ -25,6 +26,11 @@ def test_bridge_and_engine_labels_are_generic():
     assert _is_generic("Electron", "someapp") is True
 
 
+def test_generic_prefix_is_case_and_space_insensitive():
+    assert _is_generic("  ALSA plug-in [java]", "java") is True   # leading space
+    assert _is_generic("alsa plug-in [java]", "java") is True     # lowercased
+
+
 def test_runtime_names_are_generic():
     assert _is_generic("java", "java") is True
     assert _is_generic("python3", "python3") is True
@@ -36,8 +42,21 @@ def test_empty_and_unknown_are_generic():
     assert _is_generic("Unknown", "") is True
 
 
+def test_window_name_prefers_clean_class_over_volatile_title():
+    # A browser's clean WM_CLASS beats its volatile tab title.
+    assert _pick_name("Chromium", "Some Tab - Chromium") == "Chromium"
+    # Reverse-DNS / dashed classes are ugly — use the window title instead.
+    assert _pick_name("net-runelite-client-RuneLite", "RuneLite") == "RuneLite"
+    assert _pick_name("com.adamcake.Bolt", "Bolt Launcher") == "Bolt Launcher"
+    # Missing class -> title; clean class with no title -> class; nothing -> "".
+    assert _pick_name("", "Firefox") == "Firefox"
+    assert _pick_name("steamwebhelper", "") == "steamwebhelper"
+    assert _pick_name("", "") == ""
+
+
 def test_binary_name_prefers_real_binary():
     assert _binary_name("Cider", "Chromium") == "Cider"
+    assert _binary_name("/usr/bin/Cider", "Chromium") == "Cider"   # path -> basename
 
 
 def test_binary_name_rejects_runtimes_and_echoes():

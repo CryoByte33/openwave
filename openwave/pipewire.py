@@ -69,13 +69,13 @@ def _is_generic(app_name, binary):
     name = (app_name or "").strip().lower()
     if not name or name in _GENERIC_NAMES or name in _RUNTIME_BINARIES:
         return True
-    return any(app_name.startswith(p) for p in _GENERIC_PREFIXES)
+    return any(name.startswith(p.lower()) for p in _GENERIC_PREFIXES)
 
 
 def _binary_name(binary, app_name):
     """A friendly name from the process binary (e.g. "Cider" behind "Chromium"),
     or None when the binary is a runtime ("java") or just echoes app_name."""
-    b = (binary or "").strip()
+    b = (binary or "").strip().rsplit("/", 1)[-1]   # basename if it's a path
     if not b or b.lower() in _RUNTIME_BINARIES or b.lower() == app_name.strip().lower():
         return None
     return b
