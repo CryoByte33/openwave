@@ -475,12 +475,16 @@ class WaveXLRMk2:
         except Exception:
             self._card = None
             raise
-        if not {"mic_mute", "mic_gain", "hp_vol"} <= set(numid):
-            self._card = None
-            raise RuntimeError("Wave XLR MK.2 ALSA controls not found")
         self._numid, self._max = numid, maxv
-        # Best-effort vendor handle for gain read/write (needs the udev rule).
+        # Vendor handle drives gain/mute/hp/low-Z directly (needs the udev rule);
+        # ALSA is only the fallback when it's absent.
         self._h = _lib.libusb_open_device_with_vid_pid(_ctx, VENDOR_ID, PID_MK2) or None
+        # Mic gain is firmware-owned (vendor block 0x0004) and has no ALSA control
+        # on some firmware, so don't require it. Only the mute/hp controls matter,
+        # and only when there's no vendor handle to read/write them through instead.
+        if not self._h and not {"mic_mute", "hp_vol"} <= set(numid):
+            self._card = None
+            raise RuntimeError("Wave XLR MK.2 controls not found")
 
     def disconnect(self):
         if self._h:
