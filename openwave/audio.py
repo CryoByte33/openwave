@@ -27,7 +27,7 @@ import threading
 import time
 import logging
 
-log = logging.getLogger("wavexlr.audio")
+log = logging.getLogger("openwave.audio")
 
 # The Wave XLR's ALSA node substring (covers both revisions) lives in the shared
 # name vocabulary; the PipeWire adapter does the graph I/O.

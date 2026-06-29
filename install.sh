@@ -56,7 +56,7 @@ msg "installing: $PKGS"
 $SUDO sh -c "$INSTALL_CMD"
 
 # --- fetch source -------------------------------------------------------------
-if [ -f Makefile ] && [ -d wavexlr ] && [ -f wavexlr.desktop ]; then
+if [ -f Makefile ] && [ -d openwave ] && [ -f openwave.desktop ]; then
     SRC="$PWD"
     msg "using checkout: $SRC"
 else

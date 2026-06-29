@@ -3,7 +3,7 @@
 ``SubprocessPipeWire`` owns every ``pw-*`` / ``wpctl`` / ``pactl`` / ``pkill``
 invocation, its retry/poll, and its text parsing; callers cross this interface
 instead of building command lines. The adapter is name-agnostic — node names
-come from :mod:`wavexlr.pwnames`. The methods are instance methods on purpose:
+come from :mod:`openwave.pwnames`. The methods are instance methods on purpose:
 a ``FakePipeWire`` backed by an in-memory graph can satisfy the same interface
 for tests (not built yet — see the architecture review).
 """

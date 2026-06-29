@@ -16,7 +16,7 @@ import struct
 import subprocess
 import threading
 
-_log = logging.getLogger("wavexlr.device")
+_log = logging.getLogger("openwave.device")
 
 VENDOR_ID = 0x0FD9
 # Product IDs: MK1 = original UAC1 Wave XLR, MK2 = UAC2 Wave XLR MK.2. They

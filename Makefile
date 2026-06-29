@@ -14,19 +14,19 @@ SITEPKG := $(shell $(PYTHON) -c "import site; print(site.getsitepackages()[0])")
 .PHONY: install uninstall
 
 install:
-	install -dm755 $(DESTDIR)$(SITEPKG)/wavexlr
-	install -m644 wavexlr/*.py wavexlr/style.css $(DESTDIR)$(SITEPKG)/wavexlr/
+	install -dm755 $(DESTDIR)$(SITEPKG)/openwave
+	install -m644 openwave/*.py openwave/style.css $(DESTDIR)$(SITEPKG)/openwave/
 	install -dm755 $(BINDIR)
-	printf '#!/bin/sh\nexec %s -m wavexlr "$$@"\n' "$(PYTHON)" > $(BINDIR)/openwave
+	printf '#!/bin/sh\nexec %s -m openwave "$$@"\n' "$(PYTHON)" > $(BINDIR)/openwave
 	chmod 755 $(BINDIR)/openwave
-	install -Dm644 wavexlr.desktop $(DESKTOPDIR)/openwave.desktop
+	install -Dm644 openwave.desktop $(DESKTOPDIR)/openwave.desktop
 	install -Dm644 wireplumber/51-openwave-wave-xlr.conf $(APPDIR)/wireplumber/51-openwave-wave-xlr.conf
 	install -Dm644 pipewire/52-openwave-mixes.conf $(APPDIR)/pipewire/52-openwave-mixes.conf
 	install -Dm644 README.md $(DOCDIR)/README.md
 	install -Dm644 LICENSE $(LICENSEDIR)/LICENSE
 
 uninstall:
-	rm -rf $(DESTDIR)$(SITEPKG)/wavexlr
+	rm -rf $(DESTDIR)$(SITEPKG)/openwave
 	rm -f $(BINDIR)/openwave
 	rm -f $(DESKTOPDIR)/openwave.desktop
 	rm -rf $(APPDIR)

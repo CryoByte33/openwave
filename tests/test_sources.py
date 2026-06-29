@@ -9,8 +9,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from wavexlr import sources
-from wavexlr.sources import Source, SourceSet
+from openwave import sources
+from openwave.sources import Source, SourceSet
 
 
 def test_migrates_legacy_single_app():

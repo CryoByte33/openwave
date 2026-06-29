@@ -59,7 +59,7 @@ sudo make -C /path/to/openwave uninstall PREFIX=/usr/local
 
 ```bash
 openwave            # if installed via install.sh / PKGBUILD
-python3 -m wavexlr  # from a checkout, no install needed
+python3 -m openwave  # from a checkout, no install needed
 ```
 
 On first launch, OpenWave will prompt to set up USB permissions (via polkit) and install the audio service.
@@ -69,7 +69,7 @@ On first launch, OpenWave will prompt to set up USB permissions (via polkit) and
 OpenWave detects your init system at runtime:
 
 - **systemd** — the GUI installs a user unit at `~/.config/systemd/user/openwave.service` and enables it. No root needed for install or status checks.
-- **runit** (Artix, Void, Devuan-runit) — the GUI cannot install the system service itself (writing to `/etc/sv` requires root). Create a `wavexlr-audio` service directory at `/etc/sv/wavexlr-audio/` whose `run` script execs `python3 -m wavexlr.daemon` as your user (typically via `chpst -u`), then enable it with `ln -s /etc/sv/wavexlr-audio /var/service/`.
+- **runit** (Artix, Void, Devuan-runit) — the GUI cannot install the system service itself (writing to `/etc/sv` requires root). Create an `openwave-audio` service directory at `/etc/sv/openwave-audio/` whose `run` script execs `python3 -m openwave.daemon` as your user (typically via `chpst -u`), then enable it with `ln -s /etc/sv/openwave-audio /var/service/`.
 
   Status detection from the non-root GUI uses `sv check`; on stock Void the supervise FIFO is mode 0700, so OpenWave falls back to scanning `/proc` for the daemon process.
 
@@ -77,16 +77,16 @@ OpenWave detects your init system at runtime:
 
 ### Start hidden in tray
 ```bash
-python3 -m wavexlr -- --hide
+python3 -m openwave -- --hide
 ```
 
 ### Desktop entry
-Copy `wavexlr.desktop` to `~/.local/share/applications/` for app launcher integration.
+Copy `openwave.desktop` to `~/.local/share/applications/` for app launcher integration.
 
 ## Architecture
 
 ```
-wavexlr/
+openwave/
   device.py           — USB backends for MK.1 and MK.2 (raw libusb via ctypes)
   app.py              — GTK4/Adwaita window; device pane and 10 Hz polling
   devicecontroller.py — device connect/poll/reconnect, kept off the UI thread

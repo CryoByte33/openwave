@@ -24,7 +24,7 @@ import tempfile
 from pathlib import Path
 
 SYSTEMD_UNIT = "openwave.service"
-RUNIT_SERVICE = "wavexlr-audio"
+RUNIT_SERVICE = "openwave-audio"
 
 _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -60,7 +60,7 @@ After=pipewire.service wireplumber.service
 
 [Service]
 Type=simple
-ExecStart={python} -c "from wavexlr.daemon import main; main()"
+ExecStart={python} -c "from openwave.daemon import main; main()"
 WorkingDirectory={_APP_DIR}
 Restart=on-failure
 RestartSec=3
@@ -141,7 +141,7 @@ def _pkexec_script(script_body):
 
 
 def _daemon_proc_alive():
-    """Scan /proc for any 'python -m wavexlr.daemon' process.
+    """Scan /proc for any 'python -m openwave.daemon' process.
 
     Used as a fallback when `sv check` cannot read the supervise/ FIFO (mode
     0700 on stock Void) — the daemon itself runs as the user under chpst, so
@@ -157,9 +157,9 @@ def _daemon_proc_alive():
             cmdline = (entry / "cmdline").read_bytes()
         except (OSError, PermissionError):
             continue
-        # The daemon is launched as `python3 -c "from wavexlr.daemon import main; main()"`;
-        # "wavexlr.daemon" sits inside the -c argument, so use substring match.
-        if b"wavexlr.daemon" in cmdline:
+        # The daemon is launched as `python3 -c "from openwave.daemon import main; main()"`;
+        # "openwave.daemon" sits inside the -c argument, so use substring match.
+        if b"openwave.daemon" in cmdline:
             return True
     return False
 
@@ -176,7 +176,7 @@ class _Runit:
         return (
             "#!/bin/sh\n"
             "exec 2>&1\n"
-            f'exec chpst -u {user} {python} -c "from wavexlr.daemon import main; main()"\n'
+            f'exec chpst -u {user} {python} -c "from openwave.daemon import main; main()"\n'
         )
 
     def is_running(self):
