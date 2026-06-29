@@ -78,6 +78,7 @@ Earlier releases shipped as the `wavexlr` Python package, with a matching `pytho
 - GTK4, libadwaita
 - PipeWire (for the mixer and the capture fix)
 - libusb 1.0
+- python-xlib (resolves friendly app names like "RuneLite" from window titles; the raw PipeWire name is used without it)
 
 ## Usage
 
