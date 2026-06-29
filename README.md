@@ -2,6 +2,8 @@
 
 Linux control application for the **Elgato Wave XLR** microphone interface. Device controls plus a Wave-Link-style submixer, built with GTK4 + Adwaita and reverse-engineered from the Elgato app.
 
+![](screenshot.png)
+
 ## AI Disclosure
 
 This code was made with the assistance of AI, currently Claude Opus 4.8. The code that I (CryoByte33) have contributed has been reviewed thoroughly and none of my contributions have been "vibed". The bulk of AI's work was parsing USB packet captures to implement various features and to do the more rote/mundane tasks that comes with development, as I have very limited time to work on personal projects.
