@@ -135,11 +135,24 @@ def _alsa_hp_to_fw(alsa_hp):
 class WaveXLR:
     supports_low_impedance = True
     supports_volume_select = True
+    # The MK.1 also has a dial crossfade + (older) effects, but its UAC1 config
+    # block isn't mapped for them and there's no MK.1 here to reverse it safely,
+    # so these stay off until someone captures an MK.1. The UI hides them.
+    supports_crossfade = False
+    supports_voice_effects = False
     hp_detents = None   # continuous dB slider (mk1)
 
     def format_gain(self, raw):
         """Human-readable gain for the UI (mk1 gain is an opaque raw value)."""
         return f"0x{raw:04X}"
+
+    # Unmapped on the MK.1 — no-op stubs keep the backend interface uniform so
+    # the controller never AttributeErrors (the UI gates these on the caps above).
+    def set_crossfade(self, value): pass
+    def set_lowcut(self, enabled): pass
+    def set_expander(self, enabled): pass
+    def set_voice_tune(self, enabled): pass
+    def set_voice_tune_strength(self, value): pass
 
     def __init__(self):
         self._handle = None
@@ -353,6 +366,17 @@ _MK2_HP_VOL_OFFSET = 0         # block 0x0005 byte0 = hp volume (0=loudest..240=
 _MK2_FLAGS_OFFSET = 1          # byte 1 of these blocks holds flag bits
 _MK2_MUTE_MASK = 0x01          # block 0x0004 byte1 bit0: 1 = muted
 _MK2_LOWZ_MASK = 0x02          # block 0x0005 byte1 bit1: 1 = low impedance on
+# Hardware voice effects (block 0x0004 byte1 bitfield, decoded from Wave Link).
+_MK2_LOWCUT_MASK = 0x10        # bit4: low-cut filter
+_MK2_EXPANDER_MASK = 0x20      # bit5: expander
+_MK2_VOICETUNE_MASK = 0x40     # bit6: voice tune
+_MK2_VOICETUNE_STRENGTH_OFFSET = 10   # block 0x0004 byte10: voice tune strength
+_MK2_VOICETUNE_STRENGTH_MAX = 100     # 0=Weak .. 100=Strong
+# Self-monitoring crossfade: mic-vs-PC blend in the headphone monitor.
+_MK2_BLOCK_CROSSFADE = 0x0001  # 6-byte block; byte0 = crossfade, rest constant
+_MK2_CROSSFADE_LEN = 6
+_MK2_CROSSFADE_OFFSET = 0      # byte0: 0..200, 100 = centre
+_MK2_CROSSFADE_MAX = 200
 
 # Headphone volume is non-linear: the hardware wheel steps through these native
 # byte0 values (captured from a full wheel sweep), loudest(0) -> quietest(240).
@@ -448,6 +472,8 @@ class WaveXLRMk2:
 
     supports_low_impedance = True
     supports_volume_select = False
+    supports_crossfade = True
+    supports_voice_effects = True
     hp_detents = _MK2_HP_DETENTS_DB   # discrete detent slider (quietest..loudest)
 
     def format_gain(self, raw):
@@ -602,14 +628,21 @@ class WaveXLRMk2:
         # matches the LEDs). gain+mute in 0x0004, hp+low-Z in 0x0005.
         if self._h:
             try:
+                b1 = self._vread(_MK2_BLOCK_CROSSFADE, _MK2_CROSSFADE_LEN)
                 b4 = self._vread(_MK2_BLOCK_SETTINGS, _MK2_SETTINGS_LEN)
                 b5 = self._vread(_MK2_BLOCK_HP, _MK2_HP_LEN)
+                flags = b4[_MK2_FLAGS_OFFSET]
                 return {
                     "gain_raw": round(b4[_MK2_GAIN_OFFSET] / _MK2_HW_GAIN_MAX * _MK2_UI_GAIN_MAX),
-                    "mute": bool(b4[_MK2_FLAGS_OFFSET] & _MK2_MUTE_MASK),
+                    "mute": bool(flags & _MK2_MUTE_MASK),
                     "hp_volume_db": -b5[_MK2_HP_VOL_OFFSET] / 4.0,
                     "volume_select": "gain",
                     "low_impedance": bool(b5[_MK2_FLAGS_OFFSET] & _MK2_LOWZ_MASK),
+                    "crossfade": b1[_MK2_CROSSFADE_OFFSET],
+                    "lowcut": bool(flags & _MK2_LOWCUT_MASK),
+                    "expander": bool(flags & _MK2_EXPANDER_MASK),
+                    "voice_tune": bool(flags & _MK2_VOICETUNE_MASK),
+                    "voice_tune_strength": b4[_MK2_VOICETUNE_STRENGTH_OFFSET],
                 }
             except Exception:
                 pass
@@ -628,6 +661,13 @@ class WaveXLRMk2:
             "hp_volume_db": _MK2_HP_DB_MIN + hpv / hpmax * span,
             "volume_select": "gain",
             "low_impedance": False,
+            # Crossfade + voice effects are vendor-only; default them when there's
+            # no USB handle to read the blocks.
+            "crossfade": _MK2_CROSSFADE_MAX // 2,
+            "lowcut": False,
+            "expander": False,
+            "voice_tune": False,
+            "voice_tune_strength": _MK2_VOICETUNE_STRENGTH_MAX // 2,
         }
 
     def set_mute(self, muted):
@@ -679,3 +719,44 @@ class WaveXLRMk2:
             block[_MK2_FLAGS_OFFSET] &= ~_MK2_LOWZ_MASK
         self._vwrite(_MK2_BLOCK_HP, block)
         _log.info("set_low_impedance(%s) -> block 0x05 byte1=0x%02x", enabled, block[_MK2_FLAGS_OFFSET])
+
+    def set_crossfade(self, value):
+        """Self-monitoring mic/PC blend: block 0x0001 byte0, 0..200 (100 = centre)."""
+        if not self._h:
+            return  # vendor-only; no ALSA path
+        value = max(0, min(_MK2_CROSSFADE_MAX, int(value)))
+        block = self._vread(_MK2_BLOCK_CROSSFADE, _MK2_CROSSFADE_LEN)
+        block[_MK2_CROSSFADE_OFFSET] = value
+        self._vwrite(_MK2_BLOCK_CROSSFADE, block)
+        _log.debug("set_crossfade(%d)", value)
+
+    def _set_settings_bit(self, mask, enabled, name):
+        """Flip one bit of the block 0x0004 flags byte (read-modify-write)."""
+        if not self._h:
+            return  # vendor-only; no ALSA path
+        block = self._vread(_MK2_BLOCK_SETTINGS, _MK2_SETTINGS_LEN)
+        if enabled:
+            block[_MK2_FLAGS_OFFSET] |= mask
+        else:
+            block[_MK2_FLAGS_OFFSET] &= ~mask
+        self._vwrite(_MK2_BLOCK_SETTINGS, block)
+        _log.info("set_%s(%s) -> block 0x04 byte1=0x%02x", name, enabled, block[_MK2_FLAGS_OFFSET])
+
+    def set_lowcut(self, enabled):
+        self._set_settings_bit(_MK2_LOWCUT_MASK, enabled, "lowcut")
+
+    def set_expander(self, enabled):
+        self._set_settings_bit(_MK2_EXPANDER_MASK, enabled, "expander")
+
+    def set_voice_tune(self, enabled):
+        self._set_settings_bit(_MK2_VOICETUNE_MASK, enabled, "voice_tune")
+
+    def set_voice_tune_strength(self, value):
+        """Voice tune strength: block 0x0004 byte10, 0..100 (Weak..Strong)."""
+        if not self._h:
+            return  # vendor-only; no ALSA path
+        value = max(0, min(_MK2_VOICETUNE_STRENGTH_MAX, int(value)))
+        block = self._vread(_MK2_BLOCK_SETTINGS, _MK2_SETTINGS_LEN)
+        block[_MK2_VOICETUNE_STRENGTH_OFFSET] = value
+        self._vwrite(_MK2_BLOCK_SETTINGS, block)
+        _log.debug("set_voice_tune_strength(%d)", value)
