@@ -11,6 +11,11 @@ PID are the same namespaced value, so they still match even though the host
 X11/XWayland only. Every failure path returns an empty map so callers fall back
 to the PipeWire name; native-Wayland apps (no X11 window) just don't get enriched
 and usually report a sane name already.
+
+Caveat: two different sandboxes can each have a low namespaced PID (both "2"), so
+a generic-named stream could resolve to an unrelated sandbox's window. Callers
+keep this lookup to genuinely-generic names (see pipewire._is_generic) to limit
+the blast radius, but it can't be fully ruled out from PID alone.
 """
 
 import logging

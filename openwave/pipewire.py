@@ -41,7 +41,9 @@ _GENERIC_PREFIXES = ("ALSA plug-in", "alsa-playback", "PulseAudio")
 # report "Chromium" even though the binary is the actual app (e.g. "Cider").
 _GENERIC_NAMES = {"chromium", "electron", "unknown"}
 # Binaries that are runtimes/launchers, not the app itself — their name tells us
-# nothing, so for these we fall through to the owning X11 window instead.
+# nothing, so for these we fall through to the owning X11 window instead. Doubles
+# as a set of generic *names*: an app reporting application.name="java" is just
+# as unhelpful as the binary "java".
 _RUNTIME_BINARIES = {
     "java", "electron", "chromium", "chromium-browser", "chrome",
     "google-chrome", "wine", "wine64", "wine-preloader", "python", "python3",
@@ -57,13 +59,17 @@ def _to_int(v):
 
 
 def _is_generic(app_name, binary):
-    """True when application.name is an unhelpful toolkit/bridge label rather than
-    the real app — these are the ones worth enriching."""
-    if not app_name or app_name.strip().lower() in _GENERIC_NAMES:
+    """True when application.name is an unhelpful toolkit/bridge/runtime label
+    rather than the real app — only these get enriched (binary, then X11 window).
+
+    An app whose name simply matches its binary (Zen/zen, Discord/discord) is NOT
+    generic: that is the normal, good case. Treating it as generic sent it through
+    the window lookup, where a Flatpak's namespaced PID could collide with another
+    sandbox's window and mislabel it (Zen showed as "Bolt Launcher")."""
+    name = (app_name or "").strip().lower()
+    if not name or name in _GENERIC_NAMES or name in _RUNTIME_BINARIES:
         return True
-    if any(app_name.startswith(p) for p in _GENERIC_PREFIXES):
-        return True
-    return bool(binary) and app_name.strip().lower() == binary.strip().lower()
+    return any(app_name.startswith(p) for p in _GENERIC_PREFIXES)
 
 
 def _binary_name(binary, app_name):
