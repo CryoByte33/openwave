@@ -726,8 +726,14 @@ class OpenWaveApp(Adw.Application):
             )
 
     def do_shutdown(self):
-        """Tear down loopback + meter subprocesses before the process exits."""
+        """Tear down the controllers, meters, and loopback subprocesses before the
+        process exits, so apps return to their default output instead of being
+        stranded on orphaned source sinks."""
         if self._window is not None:
+            if self._window.controller is not None:
+                self._window.controller.stop()
+            if self._window.mixerctl is not None:
+                self._window.mixerctl.stop()
             if hasattr(self._window, "meter"):
                 self._window.meter.stop_all()
             if hasattr(self._window, "mixer"):
@@ -817,11 +823,6 @@ class OpenWaveApp(Adw.Application):
         win = OpenWaveWindow(application=self)
         self._window = win
         win.present()
-
-    def do_shutdown(self):
-        if self._window and self._window.controller is not None:
-            self._window.controller.stop()
-        Adw.Application.do_shutdown(self)
 
 
 def main():
