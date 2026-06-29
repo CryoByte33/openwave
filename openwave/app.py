@@ -462,12 +462,18 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         if self._live():
             self.controller.set_voice_tune_strength(scale.get_value())
 
+    def _app_display_names(self):
+        """Friendly member names, via the mixer controller. Deferred behind this
+        method so strips wired during _build_ui (before the controller exists)
+        resolve lazily when their popover opens, not at wire time."""
+        return self.mixerctl.app_display_names() if self.mixerctl else {}
+
     def _wire_strip(self, strip, source_id, removable=False):
         """Wire a channel strip to the mixer: the master trim/mute (GoXLR channel
         fader — scales all sends), each mix's cell fader/mute, and, for a user
         channel, the group member edits. Strip setters are signal-blocked, so
         restoring persisted state never echoes back here."""
-        strip.member_name_resolver = self.mixerctl.app_display_names
+        strip.member_name_resolver = self._app_display_names
         strip.connect("master-volume-changed", self._on_master_volume_changed, source_id)
         strip.connect("master-mute-toggled", self._on_master_mute_toggled, source_id)
         strip.connect("cell-volume-changed", self._on_cell_volume_changed, source_id)
