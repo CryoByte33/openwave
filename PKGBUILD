@@ -15,17 +15,17 @@ package() {
 
     # Install Python package
     local site=$(python3 -c "import site; print(site.getsitepackages()[0])")
-    install -dm755 "$pkgdir$site/wavexlr"
-    install -Dm644 wavexlr/*.py "$pkgdir$site/wavexlr/"
-    install -Dm644 wavexlr/style.css "$pkgdir$site/wavexlr/style.css"
+    install -dm755 "$pkgdir$site/openwave"
+    install -Dm644 openwave/*.py "$pkgdir$site/openwave/"
+    install -Dm644 openwave/style.css "$pkgdir$site/openwave/style.css"
 
     # Launcher script
     install -dm755 "$pkgdir/usr/bin"
-    printf '#!/bin/sh\nexec python3 -m wavexlr "$@"\n' > "$pkgdir/usr/bin/$pkgname"
+    printf '#!/bin/sh\nexec python3 -m openwave "$@"\n' > "$pkgdir/usr/bin/$pkgname"
     chmod 755 "$pkgdir/usr/bin/$pkgname"
 
     # Desktop entry
-    install -Dm644 wavexlr.desktop "$pkgdir/usr/share/applications/$pkgname.desktop"
+    install -Dm644 openwave.desktop "$pkgdir/usr/share/applications/$pkgname.desktop"
 
     # License
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

@@ -2,6 +2,10 @@
 
 Linux control application for the **Elgato Wave XLR** microphone interface. Device controls plus a Wave-Link-style submixer, built with GTK4 + Adwaita and reverse-engineered from the Elgato app.
 
+## AI Disclosure
+
+This code was made with the assistance of AI, currently Claude Opus 4.8. The code that I (CryoByte33) have contributed has been reviewed thoroughly and none of my contributions have been "vibed". The bulk of AI's work was parsing USB packet captures to implement various features and to do the more rote/mundane tasks that comes with development, as I have very limited time to work on personal projects.
+
 ## Features
 
 - **Submixer** — Send any audio source to three independent mixes: Personal (what you hear), Chat, and Record. Each source has a fader per mix plus a master that scales all three, the way a GoXLR channel works.
@@ -48,6 +52,26 @@ Uninstall:
 sudo make -C /path/to/openwave uninstall PREFIX=/usr/local
 ```
 
+### Upgrading from a `wavexlr` install
+
+Earlier releases shipped as the `wavexlr` Python package, with a matching `python3 -m wavexlr` entry point and a `wavexlr-audio` runit service. All of that is now named `openwave`. To move an existing install over:
+
+1. Reinstall from the updated source (`./install.sh`, or `sudo make install`). This adds the `openwave` package and rewrites the launcher.
+2. Re-run setup under the new name: in OpenWave's device pane, uninstall Capture Fix, then restart the app. It reinstalls the audio service and the USB rule pointing at `openwave`, and clears the old `99-wavexlr.rules` in the process.
+3. Delete the leftover `wavexlr` package, which the reinstall leaves sitting next to the new one in your Python site-packages:
+
+   ```bash
+   sudo rm -rf "$(python3 -c 'import site; print(site.getsitepackages()[0])')/wavexlr"
+   ```
+
+4. On runit only, remove the old service once `openwave-audio` is up:
+
+   ```bash
+   sudo sv down wavexlr-audio
+   sudo rm -f /var/service/wavexlr-audio
+   sudo rm -rf /etc/sv/wavexlr-audio /var/log/wavexlr-audio
+   ```
+
 ### Requirements
 
 - Python 3.10+
@@ -59,7 +83,7 @@ sudo make -C /path/to/openwave uninstall PREFIX=/usr/local
 
 ```bash
 openwave            # if installed via install.sh / PKGBUILD
-python3 -m wavexlr  # from a checkout, no install needed
+python3 -m openwave  # from a checkout, no install needed
 ```
 
 On first launch, OpenWave will prompt to set up USB permissions (via polkit) and install the audio service.
@@ -69,7 +93,7 @@ On first launch, OpenWave will prompt to set up USB permissions (via polkit) and
 OpenWave detects your init system at runtime:
 
 - **systemd** — the GUI installs a user unit at `~/.config/systemd/user/openwave.service` and enables it. No root needed for install or status checks.
-- **runit** (Artix, Void, Devuan-runit) — the GUI cannot install the system service itself (writing to `/etc/sv` requires root). Create a `wavexlr-audio` service directory at `/etc/sv/wavexlr-audio/` whose `run` script execs `python3 -m wavexlr.daemon` as your user (typically via `chpst -u`), then enable it with `ln -s /etc/sv/wavexlr-audio /var/service/`.
+- **runit** (Artix, Void, Devuan-runit) — the GUI cannot install the system service itself (writing to `/etc/sv` requires root). Create an `openwave-audio` service directory at `/etc/sv/openwave-audio/` whose `run` script execs `python3 -m openwave.daemon` as your user (typically via `chpst -u`), then enable it with `ln -s /etc/sv/openwave-audio /var/service/`.
 
   Status detection from the non-root GUI uses `sv check`; on stock Void the supervise FIFO is mode 0700, so OpenWave falls back to scanning `/proc` for the daemon process.
 
@@ -77,16 +101,16 @@ OpenWave detects your init system at runtime:
 
 ### Start hidden in tray
 ```bash
-python3 -m wavexlr -- --hide
+python3 -m openwave -- --hide
 ```
 
 ### Desktop entry
-Copy `wavexlr.desktop` to `~/.local/share/applications/` for app launcher integration.
+Copy `openwave.desktop` to `~/.local/share/applications/` for app launcher integration.
 
 ## Architecture
 
 ```
-wavexlr/
+openwave/
   device.py           — USB backends for MK.1 and MK.2 (raw libusb via ctypes)
   app.py              — GTK4/Adwaita window; device pane and 10 Hz polling
   devicecontroller.py — device connect/poll/reconnect, kept off the UI thread

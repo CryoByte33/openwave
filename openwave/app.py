@@ -23,7 +23,7 @@ from .sources import Source, SourceSet
 logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
 
-class WaveXLRWindow(Adw.ApplicationWindow):
+class OpenWaveWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs, title="OpenWave", default_width=1100, default_height=620)
         self.set_size_request(900, 520)
@@ -54,7 +54,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self.controller = DeviceController(
             GLibScheduler(), on_view=self._render,
             on_connected=self.mixer.refresh_device,
-            logger=logging.getLogger("wavexlr.app"),
+            logger=logging.getLogger("openwave.app"),
         )
         self.controller.start()
 
@@ -677,7 +677,7 @@ class WaveXLRWindow(Adw.ApplicationWindow):
         self._thr_send[name](value)
 
 
-class WaveXLRApp(Adw.Application):
+class OpenWaveApp(Adw.Application):
     def __init__(self):
         super().__init__(
             application_id="com.github.openwave",
@@ -716,7 +716,7 @@ class WaveXLRApp(Adw.Application):
             if setup.needs_setup():
                 self._show_setup_dialog()
                 return
-            self._window = WaveXLRWindow(application=self)
+            self._window = OpenWaveWindow(application=self)
             # Hide-to-tray on close instead of quitting
             self._window.connect("close-request", self._on_close_request)
             self._setup_tray()
@@ -832,7 +832,7 @@ class WaveXLRApp(Adw.Application):
     def _on_replug_done(self, dialog, result, tmp_win):
         dialog.choose_finish(result)
         tmp_win.close()
-        win = WaveXLRWindow(application=self)
+        win = OpenWaveWindow(application=self)
         self._window = win
         win.present()
 
@@ -843,5 +843,5 @@ class WaveXLRApp(Adw.Application):
 
 
 def main():
-    app = WaveXLRApp()
+    app = OpenWaveApp()
     app.run(sys.argv)
