@@ -11,6 +11,11 @@ PID are the same namespaced value, so they still match even though the host
 X11/XWayland only. Every failure path returns an empty map so callers fall back
 to the PipeWire name; native-Wayland apps (no X11 window) just don't get enriched
 and usually report a sane name already.
+
+Caveat: two different sandboxes can each have a low namespaced PID (both "2"), so
+a generic-named stream could resolve to an unrelated sandbox's window. Callers
+keep this lookup to genuinely-generic names (see pipewire._is_generic) to limit
+the blast radius, but it can't be fully ruled out from PID alone.
 """
 
 import logging
@@ -64,22 +69,33 @@ def pid_names():
             pass
 
 
+def _pick_name(res_class, wm_name):
+    """Choose the friendly name. A clean WM_CLASS is the stable app identity
+    ("Chromium") and beats _NET_WM_NAME, which for browsers/Electron is the
+    volatile tab/document title. But reverse-DNS or dashed classes
+    ("net-runelite-client-RuneLite", "com.adamcake.Bolt") are ugly, so for those
+    use the window title ("RuneLite", "Bolt Launcher")."""
+    res_class = (res_class or "").strip()
+    wm_name = (wm_name or "").strip()
+    if res_class and "." not in res_class and "-" not in res_class:
+        return res_class
+    return wm_name or res_class
+
+
 def _window_name(w, a_name, a_utf8):
-    """Prefer _NET_WM_NAME (e.g. "RuneLite"); fall back to WM_CLASS res_class."""
+    res_class = ""
+    try:
+        cls = w.get_wm_class()  # (res_name, res_class)
+        if cls and cls[1]:
+            res_class = cls[1]
+    except Exception:
+        pass
+    wm_name = ""
     try:
         p = w.get_full_property(a_name, a_utf8)
         if p and p.value:
             v = p.value
-            text = v.decode("utf-8", "replace") if isinstance(v, (bytes, bytearray)) else str(v)
-            text = text.strip()
-            if text:
-                return text
+            wm_name = v.decode("utf-8", "replace") if isinstance(v, (bytes, bytearray)) else str(v)
     except Exception:
         pass
-    try:
-        cls = w.get_wm_class()  # (res_name, res_class)
-        if cls and cls[1]:
-            return cls[1]
-    except Exception:
-        pass
-    return ""
+    return _pick_name(res_class, wm_name)

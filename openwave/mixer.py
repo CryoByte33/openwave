@@ -53,7 +53,7 @@ class Mixer:
     devices, and per-source master faders. Public methods return immediately;
     the pw-loopback/pw-cli/wpctl work runs on one background worker thread."""
 
-    def __init__(self, pw=None):
+    def __init__(self, pw=None, start_worker=True):
         # The PipeWire adapter is the only thing that touches the audio graph;
         # injectable so a FakePipeWire can drive the routing logic in tests.
         self._pw = pw or SubprocessPipeWire()
@@ -78,14 +78,17 @@ class Mixer:
         self._pending_lock = Lock()
         self._wake = Event()
         self._worker_running = True
-        self._worker = threading.Thread(
-            target=self._worker_loop, name="openwave-mixer", daemon=True,
-        )
-        self._worker.start()
-
-        # Belt-and-suspenders: even if do_shutdown is skipped, the interpreter
-        # almost always runs atexit before the process image goes away.
-        atexit.register(self._atexit_cleanup)
+        self._worker = None
+        # start_worker=False lets a test construct the mixer and drive _reconcile
+        # directly — no background thread, no atexit cleanup.
+        if start_worker:
+            self._worker = threading.Thread(
+                target=self._worker_loop, name="openwave-mixer", daemon=True,
+            )
+            self._worker.start()
+            # Belt-and-suspenders: even if do_shutdown is skipped, the interpreter
+            # almost always runs atexit before the process image goes away.
+            atexit.register(self._atexit_cleanup)
 
     def _find_alsa(self):
         """Return (mic_node_name, hp_node_name) for the Wave XLR; either may be
@@ -322,7 +325,8 @@ class Mixer:
         self._worker_running = False
         self._wake.set()
         try:
-            self._worker.join(timeout=3)
+            if self._worker is not None:
+                self._worker.join(timeout=3)
         except RuntimeError:
             pass
         with self._lock:
@@ -464,17 +468,22 @@ class Mixer:
 
     # ----- internal: declarative apply -----
     def _apply_plan(self):
-        """Compute the desired routing (routing.plan) and reconcile the live
-        graph to match, touching only the deltas. This is the single reconcile
-        path — every source/cell/master/stream change funnels here. App streams
-        are moved onto their source's sink, whose monitor each cell loopback
-        carries into a mix, which is what makes a cell subtractive."""
+        """Snapshot the current state, compute the desired routing
+        (routing.plan), and reconcile the live graph to it. The single reconcile
+        path — every source/cell/master/stream change funnels here."""
         with self._lock:
             sources = SourceSet(self._sources)
             streams = dict(self._streams)
             state = dict(self._state)
-        p = plan(sources, state, self.mic, streams)
+        self._reconcile(plan(sources, state, self.mic, streams))
 
+    def _reconcile(self, p):
+        """Diff a RoutingPlan against the live graph and apply only the deltas:
+        move app streams onto their source's sink (whose monitor each cell
+        loopback carries into a mix — what makes a cell subtractive), then
+        add/drop/re-volume the cell loopbacks. Talks to the graph only through
+        self._pw, so a FakePipeWire can verify exactly which calls a plan
+        produces — no threads, no subprocesses."""
         # Stream moves — only where the target sink changed.
         for stream_id, sink in p.moves.items():
             if self._move_targets.get(stream_id) != sink:
@@ -492,6 +501,9 @@ class Mixer:
             node_name = cell_loop(send.source_id, send.mix_id)
             if key not in self._procs:
                 self._spawn_loopback(key, send.capture, send.target, node_name)
-            if self._cell_state.get(key) != (send.volume, send.muted):
+            # Only volume/cache a loopback that actually spawned. A failed spawn
+            # would otherwise cache the level and skip re-applying it on the next
+            # (successful) retry, leaving that loopback stuck at unity.
+            if key in self._procs and self._cell_state.get(key) != (send.volume, send.muted):
                 self._set_loop_volume(key, node_name, send.volume, send.muted)
                 self._cell_state[key] = (send.volume, send.muted)

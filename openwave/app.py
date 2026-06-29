@@ -11,10 +11,10 @@ import signal
 import sys
 
 from .devicecontroller import DeviceController
+from .mixercontroller import MixerController
 from .scheduler import GLibScheduler
 from .meter import MeterMonitor
 from .mixer import Mixer, SYSTEM_SOURCE
-from .pwnames import src_sink
 from .mixmatrix import MixMatrix
 from .sourcedialog import AddSourceDialog, PickAppsDialog
 from . import setup, service
@@ -31,12 +31,7 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         # handlers back at the controller (feedback guard).
         self._updating_ui = False
         self.controller = None      # built after the UI; guards early handlers
-        self._stream_poll_id = None
-        # Live-update throttle for the matrix cell + master sliders (the device
-        # gain/HP sliders throttle inside the controller instead).
-        self._thr_pending = {}   # name -> latest value awaiting send
-        self._thr_tid = {}       # name -> GLib timeout id (None = idle)
-        self._thr_send = {}      # name -> setter callable
+        self.mixerctl = None        # built after the UI; guards early handlers
         self._sources = SourceSet.load()
 
         self._build_ui()
@@ -45,14 +40,18 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         self.mixer.set_sources(self._sources)
         self.mixer.start()
         self.meter = MeterMonitor()
-        self._meter_targets = {}
+        scheduler = GLibScheduler()
+        # The mixer controller owns the live mixer writes, the stream poll, and
+        # the meter binding (GTK-free); the window just wires signals to it.
+        self.mixerctl = MixerController(
+            self.mixer, self._sources, self.meter, scheduler, self._set_source_level)
         self._restore_strips()
-        self._start_meters()
-        self._start_stream_poll()
-        # The controller owns the device connection + the device-pane state, and
-        # rebuilds the mic/HP loopbacks on each (re)connect.
+        self.mixerctl.start_meters()
+        self.mixerctl.start_polling()
+        # The device controller owns the device connection + the device-pane
+        # state, and rebuilds the mic/HP loopbacks on each (re)connect.
         self.controller = DeviceController(
-            GLibScheduler(), on_view=self._render,
+            scheduler, on_view=self._render,
             on_connected=self.mixer.refresh_device,
             logger=logging.getLogger("openwave.app"),
         )
@@ -464,15 +463,10 @@ class OpenWaveWindow(Adw.ApplicationWindow):
             self.controller.set_voice_tune_strength(scale.get_value())
 
     def _app_display_names(self):
-        """{match-key app_name: friendly display name} from current streams, only
-        where they differ. Lets a group's member list show "RuneLite" for an
-        "ALSA plug-in [java]" match key."""
-        out = {}
-        for s in self.mixer.streams().values():
-            app, disp = s.get("app_name"), s.get("display_name")
-            if app and disp and disp != app:
-                out[app] = disp
-        return out
+        """Friendly member names, via the mixer controller. Deferred behind this
+        method so strips wired during _build_ui (before the controller exists)
+        resolve lazily when their popover opens, not at wire time."""
+        return self.mixerctl.app_display_names() if self.mixerctl else {}
 
     def _wire_strip(self, strip, source_id, removable=False):
         """Wire a channel strip to the mixer: the master trim/mute (GoXLR channel
@@ -491,27 +485,16 @@ class OpenWaveWindow(Adw.ApplicationWindow):
             strip.connect("ungroup-clicked", self._on_ungroup_clicked, source_id)
 
     def _on_master_volume_changed(self, _strip, value, source_id):
-        self._throttle(
-            ("master", source_id), value,
-            lambda v, sid=source_id: self.mixer.set_master(
-                sid, v, self.mixer.get_master(sid)["muted"]),
-        )
+        self.mixerctl.set_master_volume(source_id, value)
 
     def _on_master_mute_toggled(self, _strip, muted, source_id):
-        self.mixer.set_master(source_id, self.mixer.get_master(source_id)["volume"], muted)
+        self.mixerctl.set_master_mute(source_id, muted)
 
     def _on_cell_volume_changed(self, _strip, mix_id, value, source_id):
-        # Live throttle (same as the device sliders): leading + ~80ms while
-        # dragging + trailing, so the mix updates in real time.
-        self._throttle(
-            ("cell", source_id, mix_id), value,
-            lambda v, s=source_id, m=mix_id: self.mixer.set_cell(
-                s, m, v, self.mixer.get_cell(s, m)["muted"]),
-        )
+        self.mixerctl.set_cell_volume(source_id, mix_id, value)
 
     def _on_cell_mute_toggled(self, _strip, mix_id, muted, source_id):
-        cur = self.mixer.get_cell(source_id, mix_id)
-        self.mixer.set_cell(source_id, mix_id, cur["volume"], muted)
+        self.mixerctl.set_cell_mute(source_id, mix_id, muted)
 
     # ----- group membership -----
     def _on_add_member_clicked(self, _strip, source_id):
@@ -525,8 +508,7 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         self._sources.save()
         self._refresh_strip_members(source_id)
         self.mixer.set_sources(self._sources)
-        self.mixer.poll_streams()
-        self._refresh_app_meter(source_id)
+        self.mixerctl.poll_streams()
 
     def _on_remove_member_clicked(self, _strip, app, source_id):
         if self._sources.get(source_id) is None:
@@ -539,8 +521,7 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         self._sources.save()
         self._refresh_strip_members(source_id)
         self.mixer.set_sources(self._sources)
-        self.mixer.poll_streams()
-        self._refresh_app_meter(source_id)
+        self.mixerctl.poll_streams()
 
     def _on_rename_requested(self, _strip, name, source_id):
         name = name.strip()
@@ -563,8 +544,7 @@ class OpenWaveWindow(Adw.ApplicationWindow):
                  for m in ("personal", "chat", "record")}
         new_sources = self._sources.ungroup(source_id)
         self._sources.save()
-        self.meter.stop(source_id)
-        self._meter_targets.pop(source_id, None)
+        self.mixerctl.stop_meter(source_id)
         self.matrix.remove_source(source_id)
         self.mixer.remove_source(source_id)
         for ns in new_sources:
@@ -579,9 +559,7 @@ class OpenWaveWindow(Adw.ApplicationWindow):
             self._wire_strip(strip, ns.id, removable=True)
             self._restore_strip(ns.id)
         self.mixer.set_sources(self._sources)
-        self.mixer.poll_streams()
-        for ns in new_sources:
-            self._refresh_app_meter(ns.id)
+        self.mixerctl.poll_streams()
 
     def _refresh_strip_members(self, source_id):
         source = self._sources.get(source_id)
@@ -592,8 +570,7 @@ class OpenWaveWindow(Adw.ApplicationWindow):
     def _remove_source(self, source_id):
         """Tear a user channel down everywhere: meter, strip, persisted sources,
         and the mixer's sinks/loopbacks (its apps re-home to System)."""
-        self.meter.stop(source_id)
-        self._meter_targets.pop(source_id, None)
+        self.mixerctl.stop_meter(source_id)
         self.matrix.remove_source(source_id)
         self._sources.discard(source_id)
         self._sources.save()
@@ -628,57 +605,6 @@ class OpenWaveWindow(Adw.ApplicationWindow):
             c = self.mixer.get_cell(source_id, mix_id)
             strip.set_cell(mix_id, c["volume"], c["muted"])
 
-    def _start_stream_poll(self):
-        """Poll for new/vanished PipeWire output streams every 2 s."""
-        if self._stream_poll_id:
-            GLib.source_remove(self._stream_poll_id)
-        self._stream_poll_id = GLib.timeout_add_seconds(2, self._stream_poll_tick)
-
-    def _stream_poll_tick(self):
-        self.mixer.poll_streams()
-        for source_id in list(self._sources.ids()):
-            self._refresh_app_meter(source_id)
-        return True
-
-    def _start_meters(self):
-        """Begin metering the mic, the System catch-all, and app sources."""
-        if self.mixer.mic:
-            self.meter.start(
-                "mic", self.mixer.mic,
-                lambda level: self._set_source_level("mic", level),
-            )
-        # System level = its source sink's monitor (aggregate of unmatched apps).
-        self.meter.start(
-            SYSTEM_SOURCE, src_sink(SYSTEM_SOURCE),
-            lambda level: self._set_source_level(SYSTEM_SOURCE, level),
-        )
-        for source_id in self._sources.ids():
-            self._refresh_app_meter(source_id)
-
-    def _refresh_app_meter(self, source_id):
-        """Re-point the meter at the first currently-matching stream, or stop it
-        if none match. Called on stream-poll changes and source add."""
-        if self._sources.get(source_id) is None:
-            return
-        streams = self.mixer.streams()
-        candidate = next(
-            iter(self._sources.streams_for(source_id, streams.values())), None,
-        )
-        current = self._meter_targets.get(source_id)
-        if candidate is None:
-            if current is not None:
-                self.meter.stop(source_id)
-                self._meter_targets.pop(source_id, None)
-                self._set_source_level(source_id, 0.0)
-            return
-        if current == candidate["id"]:
-            return  # already metering this stream
-        self.meter.start(
-            source_id, candidate["node_name"],
-            lambda level, sid=source_id: self._set_source_level(sid, level),
-        )
-        self._meter_targets[source_id] = candidate["id"]
-
     def _set_source_level(self, source_id, level):
         cell = self.matrix.source(source_id)
         if cell is not None:
@@ -711,8 +637,7 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         self.mixer.set_cell(source.id, "personal", 1.0, False)
         self._restore_strip(source.id)
         self.mixer.set_sources(self._sources)
-        self.mixer.poll_streams()
-        self._refresh_app_meter(source.id)
+        self.mixerctl.poll_streams()
 
     def _on_remove_source_clicked(self, _matrix, source_id):
         source = self._sources.get(source_id)
@@ -732,32 +657,6 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         if dialog.choose_finish(result) != "remove":
             return
         self._remove_source(source_id)
-
-    # Live-update throttle for the matrix sliders: send on the leading edge,
-    # then at most every _THROTTLE_MS while the value keeps changing, plus a
-    # trailing send — so dragging a cell/master updates the mix in real time
-    # without flooding the mixer.
-    _THROTTLE_MS = 80
-
-    def _throttle(self, name, value, send_fn):
-        self._thr_pending[name] = value
-        self._thr_send[name] = send_fn
-        if self._thr_tid.get(name) is None:
-            self._thr_flush(name)
-            self._thr_tid[name] = GLib.timeout_add(self._THROTTLE_MS, self._thr_tick, name)
-
-    def _thr_tick(self, name):
-        if name in self._thr_pending:
-            self._thr_flush(name)
-            return True  # keep ticking while values are still arriving
-        self._thr_tid[name] = None
-        return False
-
-    def _thr_flush(self, name):
-        if name not in self._thr_pending:
-            return
-        value = self._thr_pending.pop(name)
-        self._thr_send[name](value)
 
 
 class OpenWaveApp(Adw.Application):
@@ -827,8 +726,14 @@ class OpenWaveApp(Adw.Application):
             )
 
     def do_shutdown(self):
-        """Tear down loopback + meter subprocesses before the process exits."""
+        """Tear down the controllers, meters, and loopback subprocesses before the
+        process exits, so apps return to their default output instead of being
+        stranded on orphaned source sinks."""
         if self._window is not None:
+            if self._window.controller is not None:
+                self._window.controller.stop()
+            if self._window.mixerctl is not None:
+                self._window.mixerctl.stop()
             if hasattr(self._window, "meter"):
                 self._window.meter.stop_all()
             if hasattr(self._window, "mixer"):
@@ -918,11 +823,6 @@ class OpenWaveApp(Adw.Application):
         win = OpenWaveWindow(application=self)
         self._window = win
         win.present()
-
-    def do_shutdown(self):
-        if self._window and self._window.controller is not None:
-            self._window.controller.stop()
-        Adw.Application.do_shutdown(self)
 
 
 def main():
