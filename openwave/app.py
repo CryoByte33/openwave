@@ -183,22 +183,19 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         self.mute_row = mute_row
         mic_group.add(mute_row)
 
+        # Slider lives in the row so it's clearly the Gain control; value at the edge.
         gain_row = Adw.ActionRow(title="Gain")
-        self.gain_label = Gtk.Label(label="—", width_chars=8, xalign=1)
+        self.gain_scale = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL, draw_value=False,
+            adjustment=Gtk.Adjustment(lower=0x0000, upper=0x5000, step_increment=0x40, page_increment=0x200),
+        )
+        self.gain_scale.set_size_request(150, -1)
+        self.gain_scale.connect("value-changed", self._on_gain_changed)
+        gain_row.add_suffix(self.gain_scale)
+        self.gain_label = Gtk.Label(label="—", width_chars=7, xalign=1)
         self.gain_label.add_css_class("monospace")
         gain_row.add_suffix(self.gain_label)
         mic_group.add(gain_row)
-
-        self.gain_scale = Gtk.Scale(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            hexpand=True,
-            draw_value=False,
-            adjustment=Gtk.Adjustment(lower=0x0000, upper=0x5000, step_increment=0x40, page_increment=0x200),
-        )
-        self.gain_scale.set_margin_start(12)
-        self.gain_scale.set_margin_end(12)
-        self.gain_scale.connect("value-changed", self._on_gain_changed)
-        parent.append(self.gain_scale)
 
         knob_row = Adw.ActionRow(title="Knob Controls", subtitle="What the physical knob adjusts")
         self.knob_label = Gtk.Label(label="Gain")
@@ -207,28 +204,71 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         self.knob_row = knob_row
         mic_group.add(knob_row)
 
+        # --- Microphone effects (hardware DSP on the mic signal) ---
+        self.effects_group = Adw.PreferencesGroup(title="Microphone Effects")
+        parent.append(self.effects_group)
+
+        self.lowcut_row = Adw.SwitchRow(
+            title="Low-cut Filter", subtitle="Roll off low-frequency rumble")
+        self.lowcut_row.connect("notify::active", self._on_lowcut_changed)
+        self.effects_group.add(self.lowcut_row)
+
+        self.expander_row = Adw.SwitchRow(
+            title="Expander", subtitle="Gate quiet background noise between words")
+        self.expander_row.connect("notify::active", self._on_expander_changed)
+        self.effects_group.add(self.expander_row)
+
+        self.voicetune_row = Adw.SwitchRow(
+            title="Voice Tune", subtitle="Pitch-correct your voice")
+        self.voicetune_row.connect("notify::active", self._on_voicetune_changed)
+        self.effects_group.add(self.voicetune_row)
+
+        self.strength_row = Adw.ActionRow(title="Voice Tune Strength")
+        self.strength_scale = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL, hexpand=True, draw_value=False,
+            adjustment=Gtk.Adjustment(lower=0, upper=100, step_increment=1, page_increment=10))
+        self.strength_scale.add_mark(0, Gtk.PositionType.BOTTOM, "Weak")
+        self.strength_scale.add_mark(100, Gtk.PositionType.BOTTOM, "Strong")
+        self.strength_scale.set_size_request(180, -1)
+        self.strength_scale.connect("value-changed", self._on_strength_changed)
+        self.strength_row.add_suffix(self.strength_scale)
+        self.effects_group.add(self.strength_row)
+
         # --- Headphone controls ---
         hp_group = Adw.PreferencesGroup(title="Headphones")
         parent.append(hp_group)
 
         hp_vol_row = Adw.ActionRow(title="Volume")
+        self.hp_scale = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL, draw_value=False,
+            adjustment=Gtk.Adjustment(lower=-60.0, upper=0.0, step_increment=0.5, page_increment=2.0),
+        )
+        self.hp_scale.set_size_request(150, -1)
+        self.hp_scale.connect("value-changed", self._on_hp_changed)
+        hp_vol_row.add_suffix(self.hp_scale)
         self.hp_label = Gtk.Label(label="—", width_chars=5, xalign=1)
         self.hp_label.add_css_class("monospace")
         hp_vol_row.add_suffix(self.hp_label)
         hp_group.add(hp_vol_row)
 
-        self.hp_scale = Gtk.Scale(
-            orientation=Gtk.Orientation.HORIZONTAL,
-            hexpand=True,
-            draw_value=False,
-            adjustment=Gtk.Adjustment(lower=-60.0, upper=0.0, step_increment=0.5, page_increment=2.0),
-        )
-        self.hp_scale.set_margin_start(12)
-        self.hp_scale.set_margin_end(12)
-        self.hp_scale.connect("value-changed", self._on_hp_changed)
-        parent.append(self.hp_scale)
+        # Self-monitoring: the device's headphone blend between your own mic
+        # (zero-latency hardware monitor) and PC audio.
+        self.crossfade_row = Adw.ActionRow(
+            title="Self-monitoring", subtitle="Headphone blend of your mic vs PC audio")
+        self.crossfade_scale = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL, hexpand=True, draw_value=False,
+            adjustment=Gtk.Adjustment(lower=0, upper=200, step_increment=2, page_increment=20))
+        self.crossfade_scale.add_mark(0, Gtk.PositionType.BOTTOM, "PC")
+        self.crossfade_scale.add_mark(100, Gtk.PositionType.BOTTOM, "Equal")
+        self.crossfade_scale.add_mark(200, Gtk.PositionType.BOTTOM, "Mic")
+        self.crossfade_scale.set_size_request(200, -1)
+        self.crossfade_scale.connect("value-changed", self._on_crossfade_changed)
+        self.crossfade_row.add_suffix(self.crossfade_scale)
+        hp_group.add(self.crossfade_row)
 
-        lowz_row = Adw.SwitchRow(title="Low Impedance", subtitle="For low impedance headphones")
+        # "High Power Mode" is Elgato's name for low-impedance mode; show both.
+        lowz_row = Adw.SwitchRow(
+            title="High Power Mode", subtitle="Boosts output for low-impedance headphones")
         lowz_row.connect("notify::active", self._on_lowz_changed)
         self.lowz_row = lowz_row
         hp_group.add(lowz_row)
@@ -333,10 +373,13 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         caps = view.caps
         self.lowz_row.set_sensitive(caps.supports_low_impedance)
         self.lowz_row.set_subtitle(
-            "For low impedance headphones" if caps.supports_low_impedance
-            else "Not yet supported on Wave XLR MK.2"
+            "Boosts output for low-impedance headphones" if caps.supports_low_impedance
+            else "Not supported on this device"
         )
         self.knob_row.set_visible(caps.supports_volume_select)
+        # Crossfade + voice effects are MK.2-only (MK.1 not yet mapped).
+        self.crossfade_row.set_visible(caps.supports_crossfade)
+        self.effects_group.set_visible(caps.supports_voice_effects)
         adj = self.hp_scale.get_adjustment()
         if caps.hp_detents:
             adj.set_lower(0)
@@ -354,6 +397,13 @@ class OpenWaveWindow(Adw.ApplicationWindow):
         self.hp_scale.set_value(view.hp_value)
         self.hp_label.set_label(self._hp_percent(view.hp_value))
         self.lowz_row.set_active(view.low_impedance)
+        self.crossfade_scale.set_value(view.crossfade)
+        self.lowcut_row.set_active(view.lowcut)
+        self.expander_row.set_active(view.expander)
+        self.voicetune_row.set_active(view.voice_tune)
+        self.strength_scale.set_value(view.voice_tune_strength)
+        # Strength only matters while Voice Tune is on.
+        self.strength_row.set_sensitive(view.voice_tune)
         self.knob_label.set_label(view.knob_label)
         self.fw_label.set_label(view.fw_version)
         self.api_label.set_label(view.api_version)
@@ -391,6 +441,27 @@ class OpenWaveWindow(Adw.ApplicationWindow):
     def _on_lowz_changed(self, row, _pspec):
         if self._live():
             self.controller.set_low_impedance(row.get_active())
+
+    def _on_crossfade_changed(self, scale):
+        if self._live():
+            self.controller.set_crossfade(scale.get_value())
+
+    def _on_lowcut_changed(self, row, _pspec):
+        if self._live():
+            self.controller.set_lowcut(row.get_active())
+
+    def _on_expander_changed(self, row, _pspec):
+        if self._live():
+            self.controller.set_expander(row.get_active())
+
+    def _on_voicetune_changed(self, row, _pspec):
+        if self._live():
+            self.controller.set_voice_tune(row.get_active())
+            self.strength_row.set_sensitive(row.get_active())
+
+    def _on_strength_changed(self, scale):
+        if self._live():
+            self.controller.set_voice_tune_strength(scale.get_value())
 
     def _wire_strip(self, strip, source_id, removable=False):
         """Wire a channel strip to the mixer: the master trim/mute (GoXLR channel
