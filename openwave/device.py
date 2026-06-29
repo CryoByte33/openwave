@@ -15,6 +15,7 @@ import re
 import struct
 import subprocess
 import threading
+from typing import Protocol
 
 _log = logging.getLogger("openwave.device")
 
@@ -130,6 +131,41 @@ def _alsa_hp_to_fw(alsa_hp):
     db = (alsa_hp - 120) * 0.5  # 0→-60, 120→0
     db = max(-128.0, min(0.0, db))  # firmware range
     return int(db * 256)
+
+
+class DeviceBackend(Protocol):
+    """What the DeviceController needs from a Wave XLR backend. Three adapters
+    satisfy it structurally: WaveXLR (MK.1), WaveXLRMk2 (MK.2), and FakeDevice in
+    the tests. The capability flags gate the optional controls; unsupported
+    setters are no-ops.
+
+    get_all() returns the polled hardware state, keyed:
+        gain_raw, mute, hp_volume_db, volume_select, low_impedance,
+        crossfade, lowcut, expander, voice_tune, voice_tune_strength
+    """
+
+    supports_low_impedance: bool
+    supports_volume_select: bool
+    supports_crossfade: bool
+    supports_voice_effects: bool
+    hp_detents: object   # tuple of dB detents, or None for a continuous slider
+
+    @property
+    def connected(self) -> bool: ...
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+    def read_device_info(self) -> dict: ...
+    def get_all(self) -> dict: ...
+    def format_gain(self, raw) -> str: ...
+    def set_mute(self, muted: bool) -> None: ...
+    def set_gain_raw(self, value) -> None: ...
+    def set_hp_volume_db(self, db: float) -> None: ...
+    def set_low_impedance(self, enabled: bool) -> None: ...
+    def set_crossfade(self, value) -> None: ...
+    def set_lowcut(self, enabled: bool) -> None: ...
+    def set_expander(self, enabled: bool) -> None: ...
+    def set_voice_tune(self, enabled: bool) -> None: ...
+    def set_voice_tune_strength(self, value) -> None: ...
 
 
 class WaveXLR:
